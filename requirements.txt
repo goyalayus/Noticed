@@ -1,0 +1,4 @@
+twikit
+google-generativeai # Or latest stable version
+python-dotenv
+aiofiles # For async file operations (optional but good practice)
