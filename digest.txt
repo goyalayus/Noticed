@@ -12,6 +12,7 @@ Directory structure:
     ├── speaking_style.txt
     ├── state_manager.py
     ├── temp.py
+    ├── test_gemini_large_context.py
     └── data/
         └── processed_tweets.json
 
@@ -5079,15 +5080,8 @@ import time
 import asyncio
 import random
 from twikit import Client as TwikitClient
-from twikit.tweet import Tweet # Import Tweet type hint
-
-# Try importing NotFound, fall back to base exception if needed
-try:
-    from twikit.errors import NotFound, Forbidden, TwitterException
-except ImportError:
-    # If NotFound doesn't exist, just import the others
-    from twikit.errors import Forbidden, TwitterException
-    NotFound = None # Define NotFound as None so the except block can check
+from twikit.tweet import Tweet # Explicitly import Tweet for type hinting
+from twikit.errors import NotFound, Forbidden, TwitterException
 
 from state_manager import StateManager
 from gemini_client import GeminiClient
@@ -5095,8 +5089,6 @@ from gemini_client import GeminiClient
 logger = logging.getLogger(__name__)
 
 class Bot:
-    """Orchestrates the bot's main logic."""
-
     def __init__(
         self,
         config: dict,
@@ -5110,217 +5102,195 @@ class Bot:
         self.state_manager = state_manager
         self.min_delay = config['min_reply_delay_seconds']
         self.max_delay = config['max_reply_delay_seconds']
-        self.own_user_id = None # Initialize own user ID
+        self.own_user_id = config.get('twitter_actual_user_id', None) # Get from config if set by main.py
+        self.bot_screen_name = config.get('twitter_username', '').lstrip('@')
 
 
-    async def _ensure_own_user_id(self):
-        """Fetches and caches the bot's own user ID if not already done."""
+    async def _ensure_own_user_id(self): # Keep this for fallback if not set by main.py
         if self.own_user_id is None:
-            bot_username = self.config.get('twitter_username', '').lstrip('@')
-            if not bot_username:
+            bot_username_to_fetch = self.bot_screen_name
+            if not bot_username_to_fetch:
                 logger.error("Twitter username missing in config. Cannot fetch own user ID.")
                 return
-
             try:
-                logger.info(f"Fetching own user details for @{bot_username}...")
-                me_user = await self.twikit_client.get_user_by_screen_name(bot_username)
+                logger.info(f"Fetching own user details for @{bot_username_to_fetch}...")
+                me_user = await self.twikit_client.get_user_by_screen_name(bot_username_to_fetch)
                 if me_user and me_user.id:
-                    self.own_user_id = me_user.id
-                    logger.info(f"Fetched own user ID: {self.own_user_id}")
+                    self.own_user_id = str(me_user.id)
+                    logger.info(f"Fetched own user ID: {self.own_user_id} for @{me_user.screen_name}")
                 else:
-                    logger.error(f"Could not fetch valid user details for @{bot_username}.")
+                    logger.error(f"Could not fetch valid user details for @{bot_username_to_fetch}.")
             except TwitterException as e:
-                logger.error(f"Could not fetch own user details for @{bot_username}: {e}. Self-checks will be skipped.")
-            except AttributeError:
-                logger.error(f"Could not fetch own user details for @{bot_username} due to missing 'get_user_by_screen_name' method or user attributes.")
+                logger.error(f"Could not fetch own user details for @{bot_username_to_fetch} (Twikit Error): {e}.")
             except Exception as e:
-                 logger.error(f"Unexpected error fetching own user details for @{bot_username}: {e}")
+                 logger.error(f"Unexpected error fetching own user details for @{bot_username_to_fetch}: {e}")
 
 
     async def run_iteration(self) -> None:
-        """Performs one cycle of fetching, generating, and replying."""
         logger.info("Starting bot iteration...")
         iteration_start_time = time.monotonic()
-        processed_count = 0
-        reply_count = 0
-        error_count = 0
+        processed_this_iteration = 0 # Renamed for clarity
+        replied_this_iteration = 0   # Renamed for clarity
+        errors_this_iteration = 0    # Renamed for clarity
         state_changed = False
 
-        # --- Uncomment this block if you want to enable self-checks ---
-        # logger.info("Ensuring own user ID is known for self-checks...")
-        # await self._ensure_own_user_id()
-        # if not self.own_user_id:
-        #     logger.warning("Own user ID could not be determined. Self-checks will be disabled.")
-        # -------------------------------------------------------------
+        if not self.own_user_id: # Attempt to fetch if not available from config
+            await self._ensure_own_user_id()
 
-        # 1. Fetch Home Timeline Tweets
-        tweets = []
+        tweets: list[Tweet] = [] # Ensure tweets is typed
         try:
             logger.info(f"Fetching up to {self.config['tweets_to_fetch']} tweets from latest timeline...")
-            # *** FIX APPLIED HERE: Use get_latest_timeline ***
-            # Assuming it takes a 'count' argument similar to the previous attempt.
-            # Further verification might be needed if it uses different parameters.
             timeline_result = await self.twikit_client.get_latest_timeline(count=self.config['tweets_to_fetch'])
 
-            # Process the result - could be list, iterator, or async iterator
             if hasattr(timeline_result, '__aiter__'):
-                 logger.debug("Timeline result is an async iterator.")
                  tweets = [t async for t in timeline_result]
             elif hasattr(timeline_result, '__iter__') and not isinstance(timeline_result, str):
-                 logger.debug("Timeline result is a sync iterator or list.")
                  tweets = list(timeline_result)
-            # No need for explicit list check if list also has __iter__
-            # elif isinstance(timeline_result, list):
-            #      logger.debug("Timeline result is a list.")
-            #      tweets = timeline_result
             else:
-                 logger.warning(f"Unexpected type returned by get_latest_timeline: {type(timeline_result)}. Assuming empty list.")
-                 tweets = []
-
+                 logger.warning(f"Unexpected type from get_latest_timeline: {type(timeline_result)}. Assuming empty.")
+            
             if not tweets:
-                 logger.info("No new tweets found in timeline fetch for this iteration.")
-                 # Optional: Save state even if no tweets found, to record the check time?
-                 # if state_changed: await self.state_manager.save()
-                 return # Successful iteration, nothing new to do
-
-            logger.info(f"Fetched {len(tweets)} tweets. Processing potential replies...")
-
-        except AttributeError:
-             # This might catch if 'get_latest_timeline' also doesn't exist, but unlikely given the previous error msg
-             logger.critical(f"FATAL: The 'get_latest_timeline' method does not seem to exist on the twikit client.", exc_info=True)
-             raise # Re-raise to stop the bot service
-
+                 logger.info("No new tweets found in timeline fetch.")
+                 return
+            logger.info(f"Fetched {len(tweets)} tweets. Processing potential replies (oldest first)...")
+        # ... (rest of the timeline fetching error handling as before) ...
+        except AttributeError as e:
+             logger.critical(f"FATAL: Method missing in twikit client (e.g., 'get_latest_timeline'): {e}", exc_info=True)
+             raise
         except TypeError as e:
-            # Catch if 'count' is not a valid argument for get_latest_timeline
-            logger.critical(f"FATAL: TypeError calling 'get_latest_timeline'. Does it accept a 'count' argument? Error: {e}", exc_info=True)
-            raise # Re-raise to stop the bot service
-
+            logger.critical(f"FATAL: TypeError calling timeline fetch: {e}", exc_info=True)
+            raise
         except TwitterException as e:
-            logger.error(f"Failed to fetch Twitter timeline using get_latest_timeline: {e}", exc_info=True)
-            return # End this iteration
+            logger.error(f"Failed to fetch Twitter timeline: {e}", exc_info=False)
+            return
         except Exception as e:
-            logger.error(f"An unexpected error occurred during timeline fetch: {e}", exc_info=True)
-            return # End this iteration
+            logger.error(f"An unexpected error during timeline fetch: {e}", exc_info=True)
+            return
 
-
-        # Process oldest first in the fetched batch
-        for i, tweet in enumerate(reversed(tweets)):
-            # Check if it's a valid Tweet object from twikit
-            if not isinstance(tweet, Tweet) or not hasattr(tweet, 'id') or not hasattr(tweet, 'text'):
-                 # Log the type if it's unexpected
-                 logger.warning(f"Skipping invalid/unexpected timeline item (type: {type(tweet)}): {tweet!r}")
+        for i, tweet_obj in enumerate(reversed(tweets)): # Use a more descriptive name
+            if not isinstance(tweet_obj, Tweet) or not hasattr(tweet_obj, 'id'):
+                 logger.warning(f"Skipping invalid timeline item (type: {type(tweet_obj)}): {tweet_obj!r}")
                  continue
 
-            tweet_id = str(tweet.id)
-            tweet_text = tweet.text or "" # Ensure text is not None
-            tweet_author_user = getattr(tweet, 'user', None)
-            # Safely access screen_name, provide default
-            tweet_author_handle = getattr(tweet_author_user, 'screen_name', 'unknown_user') if tweet_author_user else 'unknown_user'
-            tweet_url = f"https://x.com/{tweet_author_handle}/status/{tweet_id}"
+            tweet_id_str = str(tweet_obj.id)
+            
+            tweet_author = getattr(tweet_obj, 'user', None)
+            tweet_author_id = str(getattr(tweet_author, 'id', None)) if tweet_author else None
+            tweet_author_handle = getattr(tweet_author, 'screen_name', 'unknown_user') if tweet_author else 'unknown_user'
+            current_tweet_url = f"https://x.com/{tweet_author_handle}/status/{tweet_id_str}"
 
-            logger.info(f"Checking tweet ({i+1}/{len(tweets)}): {tweet_url}")
+            logger.info(f"Checking tweet ({i+1}/{len(tweets)}): {current_tweet_url} by @{tweet_author_handle}")
 
-            # 2. Check if Already Processed
-            if self.state_manager.is_processed(tweet_id):
-                logger.info(f"Skipping already processed tweet ID {tweet_id}")
+            if self.state_manager.is_processed(tweet_id_str):
+                logger.info(f"Skipping already processed tweet ID {tweet_id_str}")
                 continue
 
-            processed_count += 1 # Count tweets we actually attempt to process
+            if self.own_user_id:
+                if tweet_author_id == self.own_user_id:
+                    logger.info(f"Skipping own tweet: {tweet_id_str}")
+                    await self.state_manager.mark_processed(tweet_id_str); state_changed = True
+                    continue
+                
+                reply_to_user_id_val = getattr(tweet_obj, 'in_reply_to_user_id_str', None)
+                if reply_to_user_id_val == self.own_user_id:
+                    logger.info(f"Skipping reply to self: {tweet_id_str}")
+                    await self.state_manager.mark_processed(tweet_id_str); state_changed = True
+                    continue
+            
+            processed_this_iteration += 1
 
-            # --- Optional Self-Checks (Requires _ensure_own_user_id to be called and successful) ---
-            # if self.own_user_id:
-            #     try:
-            #         tweet_author_id = getattr(tweet_author_user, 'id', None)
-            #         if tweet_author_id and str(tweet_author_id) == str(self.own_user_id):
-            #             logger.info(f"Skipping own tweet: {tweet_id}")
-            #             await self.state_manager.mark_processed(tweet_id)
-            #             state_changed = True
-            #             continue
-            #
-            #         reply_to_user_id_str = getattr(tweet, 'in_reply_to_user_id_str', None)
-            #         if reply_to_user_id_str and reply_to_user_id_str == str(self.own_user_id):
-            #             logger.info(f"Skipping reply to self: {tweet_id}")
-            #             await self.state_manager.mark_processed(tweet_id)
-            #             state_changed = True
-            #             continue
-            #     except Exception as e:
-            #          logger.warning(f"Error during self-check for tweet {tweet_id}: {e}", exc_info=False)
-            # ------------------------------------------------------------------------------------
+            # --- Enhanced Context Extraction for Retweets and Quote Tweets ---
+            text_for_gemini = getattr(tweet_obj, 'text', "") or ""
+            image_urls_for_gemini = []
 
-            # 3. Generate Reply using Gemini
-            if not tweet_text.strip():
-                logger.warning(f"Skipping tweet {tweet_id} because its text is empty or whitespace.")
-                await self.state_manager.mark_processed(tweet_id) # Mark as processed to avoid retrying
-                state_changed = True
+            # Helper to extract media URLs
+            def get_media_urls(media_list):
+                urls = []
+                if media_list:
+                    for media_item in media_list:
+                        if getattr(media_item, 'type', None) == 'photo':
+                            url = getattr(media_item, 'media_url_https', None)
+                            if url: urls.append(url)
+                return urls
+
+            # Extract images from the current tweet object first
+            image_urls_for_gemini.extend(get_media_urls(getattr(tweet_obj, 'media', None)))
+
+            is_native_retweet = hasattr(tweet_obj, 'retweeted_status') and tweet_obj.retweeted_status is not None
+            is_quote_tweet = hasattr(tweet_obj, 'quoted_status') and tweet_obj.quoted_status is not None
+
+            if is_native_retweet:
+                original_rt_status = tweet_obj.retweeted_status
+                logger.info(f"Tweet {tweet_id_str} is a native retweet of {getattr(original_rt_status, 'id', 'N/A')}. Using original tweet's content.")
+                text_for_gemini = getattr(original_rt_status, 'text', "") or ""
+                # If the retweet itself had no media, check the original retweeted status for media
+                if not image_urls_for_gemini:
+                    image_urls_for_gemini.extend(get_media_urls(getattr(original_rt_status, 'media', None)))
+            
+            elif is_quote_tweet:
+                quoted_status_obj = tweet_obj.quoted_status
+                commenter_text = getattr(tweet_obj, 'text', "") or "" # Text added by the one quoting
+                original_quoted_text = getattr(quoted_status_obj, 'text', "") or ""
+                
+                logger.info(f"Tweet {tweet_id_str} is a quote tweet. Quoted tweet ID: {getattr(quoted_status_obj, 'id', 'N/A')}. Combining texts.")
+                text_for_gemini = (
+                    f"Commenter's Text: {commenter_text}\n"
+                    f"Original Quoted Text: {original_quoted_text}"
+                )
+                # Prioritize images from the quote tweet's comment if any, then from original quoted
+                if not image_urls_for_gemini: # If tweet_obj.media (commenter's media) was empty
+                    image_urls_for_gemini.extend(get_media_urls(getattr(quoted_status_obj, 'media', None)))
+
+            if not text_for_gemini.strip() and not image_urls_for_gemini:
+                logger.warning(f"Skipping tweet {tweet_id_str}: no effective text and no processable images after context extraction.")
+                await self.state_manager.mark_processed(tweet_id_str); state_changed = True
                 continue
-
-            logger.info(f"Generating reply for tweet ID {tweet_id}...")
-            reply_text = await self.gemini_client.generate_reply(tweet_text)
+            
+            logger.info(f"Generating reply for tweet ID {tweet_id_str} (Text: '{text_for_gemini[:30].strip()}...', Images: {len(image_urls_for_gemini)})")
+            reply_text = await self.gemini_client.generate_reply(text_for_gemini, image_urls_for_gemini)
 
             if not reply_text:
-                logger.warning(f"Gemini did not return a reply for tweet {tweet_id}. Skipping post.")
-                error_count += 1
-                await self.state_manager.mark_processed(tweet_id)
-                state_changed = True
+                logger.warning(f"Gemini did not return a reply for tweet {tweet_id_str}. Skipping post.")
+                errors_this_iteration += 1
+                await self.state_manager.mark_processed(tweet_id_str); state_changed = True
                 continue
 
-            # 4. Post Reply to Twitter
-            logger.info(f"Attempting to post reply to tweet ID {tweet_id}...")
+            logger.info(f"Attempting to post reply to tweet ID {tweet_id_str}...")
             try:
-                # Ensure the tweet object has the 'reply' method
-                if not hasattr(tweet, 'reply') or not callable(tweet.reply):
-                    logger.error(f"Tweet object for ID {tweet_id} does not have a callable 'reply' method. Skipping reply.")
-                    error_count += 1
-                    # Mark as processed? Or leave for potential future fix? Let's mark it.
-                    await self.state_manager.mark_processed(tweet_id)
-                    state_changed = True
+                if not hasattr(tweet_obj, 'reply') or not callable(tweet_obj.reply):
+                    logger.error(f"Tweet object for ID {tweet_id_str} (user @{tweet_author_handle}) does not have a callable 'reply' method.")
+                    errors_this_iteration += 1
+                    await self.state_manager.mark_processed(tweet_id_str); state_changed = True
                     continue
 
-                reply_tweet = await tweet.reply(reply_text)
-                reply_count += 1
+                replied_tweet = await tweet_obj.reply(reply_text)
+                replied_this_iteration += 1
                 state_changed = True
-                reply_tweet_id = getattr(reply_tweet, 'id', 'UNKNOWN_ID')
-                logger.info(f"Successfully posted reply to {tweet_url}. New tweet ID: {reply_tweet_id}")
+                replied_tweet_id = getattr(replied_tweet, 'id', 'UNKNOWN_ID')
+                logger.info(f"Successfully posted reply to {current_tweet_url}. New tweet ID: {replied_tweet_id}")
+                await self.state_manager.mark_processed(tweet_id_str)
 
-                # 5. Mark as Processed (only after successful post)
-                await self.state_manager.mark_processed(tweet_id)
-
-                # 6. Randomized Delay
                 is_last_tweet_in_batch = (i == len(tweets) - 1)
-                if not is_last_tweet_in_batch:
+                if not is_last_tweet_in_batch and replied_this_iteration > 0:
                     delay = random.uniform(self.min_delay, self.max_delay)
-                    logger.info(f"Waiting for {delay:.2f}s (randomized {self.min_delay}-{self.max_delay}s) before processing next tweet...")
+                    logger.info(f"Waiting for {delay:.2f}s before next tweet...")
                     await asyncio.sleep(delay)
-                else:
-                    logger.info("Successfully replied to the last tweet in this batch. No intra-batch delay needed.")
 
-            # Specific exception handling for replies
-            except NotFound if NotFound else Exception as e:
-                 if NotFound and isinstance(e, NotFound):
-                     logger.warning(f"Original tweet {tweet_id} not found when trying to reply (NotFound error). Maybe deleted? Skipping.")
-                     error_count += 1
-                     await self.state_manager.mark_processed(tweet_id) # Mark as processed
-                     state_changed = True
-                 else:
-                     # Reraise if NotFound not defined or error is different, to be caught below
-                     raise e
-
+            except NotFound:
+                 logger.warning(f"Original tweet {tweet_id_str} not found (NotFound error). Maybe deleted? Skipping.")
+                 errors_this_iteration += 1
+                 await self.state_manager.mark_processed(tweet_id_str); state_changed = True
             except Forbidden as e:
-                 logger.error(f"Forbidden to reply to tweet {tweet_id}: {e}. Skipping.", exc_info=False) # Less verbose log
-                 error_count += 1
-                 await self.state_manager.mark_processed(tweet_id) # Mark as processed
-                 state_changed = True
+                 logger.error(f"Forbidden to reply to tweet {tweet_id_str}: {e}. Skipping.", exc_info=False)
+                 errors_this_iteration += 1
+                 await self.state_manager.mark_processed(tweet_id_str); state_changed = True
             except TwitterException as e:
-                # More specific error logging could go here based on e.response or e.api_codes if available
-                logger.error(f"Twitter API error posting reply for tweet {tweet_id}: {e}", exc_info=True)
-                error_count += 1
-                # Don't mark as processed, could be temporary (rate limit, etc.)
+                logger.error(f"Twitter API error posting reply for tweet {tweet_id_str}: {e}", exc_info=False)
+                errors_this_iteration += 1
             except Exception as e:
-                 logger.error(f"An unexpected error occurred while replying to {tweet_id}: {e}", exc_info=True)
-                 error_count += 1
-                 # Consider marking processed only for certain unexpected errors, otherwise retry might be ok
+                 logger.error(f"An unexpected error replying to {tweet_id_str}: {e}", exc_info=True)
+                 errors_this_iteration += 1
 
-        # 7. Save State if Changed
         if state_changed:
             logger.info("Saving updated state...")
             await self.state_manager.save()
@@ -5328,7 +5298,7 @@ class Bot:
         iteration_duration = time.monotonic() - iteration_start_time
         logger.info(
             f"Iteration completed in {iteration_duration:.2f}s. "
-            f"Checked: {processed_count}, Replied: {reply_count}, Errors: {error_count}."
+            f"Tweets processed: {processed_this_iteration}, Replied: {replied_this_iteration}, Errors: {errors_this_iteration}."
         )
 
 
@@ -5339,13 +5309,13 @@ File: config.py
 import os
 import logging
 from dotenv import load_dotenv
-from pathlib import Path # Use pathlib for better path handling
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 def load_config():
     """Loads configuration from .env file and environment variables."""
-    load_dotenv()  # Load variables from .env file
+    load_dotenv()
 
     config = {}
 
@@ -5356,39 +5326,38 @@ def load_config():
         raise ValueError("Missing GEMINI_API_KEY")
 
     # --- Twitter Auth ---
-    # Twikit documentation suggests username/email (auth_info_1) and password are required for login method,
-    # even if cookies are primarily used afterwards.
     config['twitter_username'] = os.getenv('TWITTER_USERNAME')
-    config['twitter_email'] = os.getenv('TWITTER_EMAIL') # Optional (auth_info_2 for login)
+    config['twitter_email'] = os.getenv('TWITTER_EMAIL')
     config['twitter_password'] = os.getenv('TWITTER_PASSWORD')
-    config['twitter_cookie_file'] = os.getenv('TWITTER_COOKIE_FILE') # Optional path to cookies.json
+    config['twitter_cookie_file'] = os.getenv('TWITTER_COOKIE_FILE') # Path to cookies.json
 
-    # Validate that required credentials for the login() method are present
     if not config['twitter_username']:
-         logger.critical("FATAL ERROR: Missing required environment variable: TWITTER_USERNAME (required for twikit login)")
+         logger.critical("FATAL ERROR: Missing required environment variable: TWITTER_USERNAME")
          raise ValueError("Missing TWITTER_USERNAME")
     if not config['twitter_password']:
-         logger.critical("FATAL ERROR: Missing required environment variable: TWITTER_PASSWORD (required for twikit login)")
+         logger.critical("FATAL ERROR: Missing required environment variable: TWITTER_PASSWORD")
          raise ValueError("Missing TWITTER_PASSWORD")
 
-    # Check for cookie file existence only if it's configured
-    cookie_path = None
-    if config['twitter_cookie_file']:
-        cookie_path = Path(config['twitter_cookie_file'])
+    cookie_path_str = config['twitter_cookie_file']
+    if cookie_path_str:
+        cookie_path = Path(cookie_path_str)
         if not cookie_path.is_file():
-            logger.critical(f"FATAL ERROR: TWITTER_COOKIE_FILE is set ('{config['twitter_cookie_file']}') but the file does not exist or is not a file.")
-            raise ValueError(f"Cookie file not found or invalid: {config['twitter_cookie_file']}")
-        config['twitter_cookie_file_path'] = cookie_path # Store Path object if valid
+            logger.warning(f"TWITTER_COOKIE_FILE ('{cookie_path_str}') not found or is not a file. Login will rely on credentials only and may attempt to create/update this file.")
+            config['twitter_cookie_file_path'] = cookie_path # Store path even if not existing yet for twikit to use
+        else:
+            config['twitter_cookie_file_path'] = cookie_path
+            logger.info(f"Twitter cookie file found: {cookie_path}")
     else:
-        config['twitter_cookie_file_path'] = None
+        # If TWITTER_COOKIE_FILE is not set in .env, default to 'cookies.json' in the project root
+        # Twikit's login function will attempt to use/create it.
+        default_cookie_path = Path('cookies.json')
+        config['twitter_cookie_file_path'] = default_cookie_path
+        logger.info(f"TWITTER_COOKIE_FILE not set in .env. Defaulting to use/create '{default_cookie_path}'.")
 
-
-    # Log a warning if both methods are technically configured
-    if config['twitter_username'] and config['twitter_password'] and config['twitter_cookie_file']:
-         logger.warning("Both Twitter credentials and cookie file are configured. Twikit login requires credentials; cookie file will likely be used for subsequent session persistence if valid.")
 
     # --- Bot Settings ---
     config['speaking_style_file_path'] = Path(os.getenv('SPEAKING_STYLE_FILE_PATH', 'speaking_style.txt'))
+    config['blog_content_file_path'] = Path(os.getenv('BLOG_CONTENT_FILE_PATH', 'blogs.txt'))
     config['state_file_path'] = Path(os.getenv('STATE_FILE_PATH', 'data/processed_tweets.json'))
 
     try:
@@ -5423,71 +5392,33 @@ def load_config():
         config['min_reply_delay_seconds'] = 30
         config['max_reply_delay_seconds'] = 60
 
-    # --- Create data directory ---
-    state_dir = config['state_file_path'].parent # Get directory from Path object
-    if state_dir: # Check if there is a parent directory (might be '.' if file is in root)
+    state_dir = config['state_file_path'].parent
+    if state_dir:
         try:
-            state_dir.mkdir(parents=True, exist_ok=True) # Use pathlib's mkdir
+            state_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Ensured data directory exists: {state_dir}")
         except OSError as e:
-            # Changed to warning as maybe permissions are the issue, not creation itself
-            logger.warning(f"Could not create or access data directory '{state_dir}': {e}. Ensure it exists and is writable.")
+            logger.warning(f"Could not create or access data directory '{state_dir}': {e}.")
         except Exception as e:
              logger.error(f"Unexpected error ensuring data directory '{state_dir}' exists: {e}")
 
-    # Ensure speaking style file exists
     if not config['speaking_style_file_path'].is_file():
         logger.critical(f"FATAL ERROR: Speaking style file not found at '{config['speaking_style_file_path']}'.")
         raise FileNotFoundError(f"Speaking style file not found: {config['speaking_style_file_path']}")
 
+    if not config['blog_content_file_path'].is_file():
+        logger.critical(f"FATAL ERROR: Blog content file not found at '{config['blog_content_file_path']}'.")
+        raise FileNotFoundError(f"Blog content file not found: {config['blog_content_file_path']}")
 
     logger.info("Configuration loaded successfully.")
     return config
-
-# Example usage (optional, for testing)
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
-    try:
-        cfg = load_config()
-        print("\n--- Loaded Config (Passwords Masked) ---")
-        for key, value in cfg.items():
-            # Mask passwords/api keys for printing
-            if ('password' in key.lower() or 'api_key' in key.lower()) and value:
-                 print(f"  {key}: ******")
-            elif isinstance(value, Path):
-                 print(f"  {key}: {str(value)}") # Print Path object as string
-            else:
-                 print(f"  {key}: {value}")
-        print("----------------------------------------")
-
-    except (ValueError, FileNotFoundError) as e:
-        print(f"\nError loading config: {e}")
-    except Exception as e:
-        print(f"\nUnexpected error during config load test: {e}")
 
 
 
 ================================================
 File: cookies.json
 ================================================
-
-
-{
-  "__cf_bm": "RXnS9n4uO.Rr1Vy_bk5TCoO1oC_Tdbu0anBGedz7o0M-1743445883-1.0.1.1-D5Bi6UUta5hCDFMLFoK80ymZznS4sJXq0uQMrYZyIpqxyzO76B1ybz4_QRUWHL6rOIYnD7rmOZSCYNUosubwP.WBCJ8vj3va47ZPxMVcKBo",
-  "auth_token": "aae545116e162f49abe94983fc91b2e96a6362aa",
-  "ct0": "ae0295a46a2bbd1aca3438cf717f51cf6418c7ad735ab87b9b0f2307af2bc1ff91d0aeb38232528c8b218f375ee862776ffda59ef29602279423cfd042fe571a64756d2f4717520fd5bbdaaa7ec5b976",
-  "external_referer": "padhuUp37zjgzgv1mFWxJ12Ozwit7owX|0|8e8t2xd8A2w=",
-  "g_state": "{\"i_l\": 0}",
-  "guest_id": "v1:174186214978370699",
-  "guest_id_ads": "v1:174186214978370699",
-  "guest_id_marketing": "v1:174186214978370699",
-  "kdt": "CuJazp5c9hNQDmwLc4n8tuKvcMR010l5NLD49wyp",
-  "lang": "en",
-  "personalization_id": "v1_3bxVetA5WDB/eeJjXHEbQQ==",
-  "ph_phc_TXdpocbGVeZVm5VJmAsHTMrCofBQu3e0kN8HGMNGTVW_posthog": "{\"distinct_id\":\"0195e88a-5d4f-7f76-9283-d454d0d0a014\",\"$sesid\":[1743363227784,\"0195e88a-5d4e-7d20-8a0d-4d05d66c1d22\",1743363136846]}",
-  "twid": "u=1621359848607858688"
-}
-
+{"__cf_bm": "Vyu.CKzmS1a77ept5wEs8BCFQ.0dHHOQl_zyLSFJ3A4-1748715371-1.0.1.1-rMhlQhYjS1pL5g9aWfm94Un67RT1BlfWYx8BFSYVaBpzoGv6Tx1AcWwo7nwgkB0XF49Bie0DMPoOBW3gckdKPzSib.d44iGoxUVOubIDdC8", "auth_token": "aae545116e162f49abe94983fc91b2e96a6362aa", "ct0": "ae0295a46a2bbd1aca3438cf717f51cf6418c7ad735ab87b9b0f2307af2bc1ff91d0aeb38232528c8b218f375ee862776ffda59ef29602279423cfd042fe571a64756d2f4717520fd5bbdaaa7ec5b976", "external_referer": "padhuUp37zjgzgv1mFWxJ12Ozwit7owX|0|8e8t2xd8A2w=", "g_state": "{\"i_l\": 0}", "guest_id": "v1:174186214978370699", "guest_id_ads": "v1:174186214978370699", "guest_id_marketing": "v1:174186214978370699", "kdt": "CuJazp5c9hNQDmwLc4n8tuKvcMR010l5NLD49wyp", "lang": "en", "personalization_id": "v1_3bxVetA5WDB/eeJjXHEbQQ==", "ph_phc_TXdpocbGVeZVm5VJmAsHTMrCofBQu3e0kN8HGMNGTVW_posthog": "{\"distinct_id\":\"0195e88a-5d4f-7f76-9283-d454d0d0a014\",\"$sesid\":[1743363227784,\"0195e88a-5d4e-7d20-8a0d-4d05d66c1d22\",1743363136846]}", "twid": "u=1621359848607858688"}
 
 
 ================================================
@@ -5519,71 +5450,84 @@ MAX_REPLY_DELAY_SECONDS=60 # Max random delay between replies in a batch
 ================================================
 File: gemini_client.py
 ================================================
-# gemini_client.py
-
 import google.generativeai as genai
 import logging
 import os
 from pathlib import Path
 import asyncio
-# Import exceptions for more specific handling if needed
+import aiofiles
+import aiohttp # For fetching images
+from PIL import Image # For image type detection
+import io # For working with bytes as files
+
+from google.generativeai import types as generation_types
+# from google.generativeai.types import Part # REMOVED
 from google.api_core import exceptions as api_core_exceptions
-from google.generativeai.types import generation_types
+
 
 logger = logging.getLogger(__name__)
 
-# --- Configuration ---
-# GEMINI_MODEL_NAME = 'gemini-1.5-flash-latest' # Try this if Pro continues to fail
-GEMINI_MODEL_NAME = 'gemini-2.5-pro-exp-03-25'
-MAX_REPLY_LENGTH = 280
+GEMINI_MODEL_NAME = 'gemini-2.5-pro-preview-05-06'
+MAX_REPLY_LENGTH = 140
 
-# --- Safety Settings ---
-# Let's try WITH DEFAULTS first, like temp.py
-# If this still fails, uncommenting BLOCK_NONE can be tried again,
-# but default is often safer and sometimes avoids unexpected policy blocks.
-SAFETY_SETTINGS = None
-# SAFETY_SETTINGS = {
-#     genai.types.HarmCategory.HARM_CATEGORY_HARASSMENT: genai.types.HarmBlockThreshold.BLOCK_NONE,
-#     genai.types.HarmCategory.HARM_CATEGORY_HATE_SPEECH: genai.types.HarmBlockThreshold.BLOCK_NONE,
-#     genai.types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: genai.types.HarmBlockThreshold.BLOCK_NONE,
-#     genai.types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: genai.types.HarmBlockThreshold.BLOCK_NONE,
-# }
+SAFETY_SETTINGS = {
+    generation_types.HarmCategory.HARM_CATEGORY_HARASSMENT: generation_types.HarmBlockThreshold.BLOCK_NONE,
+    generation_types.HarmCategory.HARM_CATEGORY_HATE_SPEECH: generation_types.HarmBlockThreshold.BLOCK_NONE,
+    generation_types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: generation_types.HarmBlockThreshold.BLOCK_NONE,
+    generation_types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: generation_types.HarmBlockThreshold.BLOCK_NONE,
+}
 
-# --- Prompt Template (Keep as is) ---
-INSTRUCTION_TEMPLATE = """You are an AI assistant generating Twitter replies based on a user's past style.
-Generate a reply to the target tweet, adhering strictly to the provided speaking style.
+INSTRUCTION_TEMPLATE_TEXT_PART = """You are Ayush Goyal, a 20-year-old software developer from IIT Roorkee with aspirations to be a founder.
+You are active on Twitter, sharing thoughtful perspectives and engaging in discussions related to technology, startups, product development, and occasionally, personal growth and philosophical musings.
+The goal of your Twitter replies is to provide value, sound knowledgeable and insightful (drawing from the kind of thinking and analysis present in your blog content provided separately below), and encourage meaningful interactions that might lead to new followers.
 
-Constraints:
-- Max length: {max_chars} characters.
-- Match the tone and vocabulary of the speaking style reference.
-- Be humble and conversational if the style dictates.
-- **CRITICAL: Output *ONLY* the raw tweet reply text.** No introductions, explanations, quotes, or extra formatting.
+**Your Knowledge Base (Consider this as your past writings and thoughts):**
+--- START BLOG CONTENT ---
+{blog_content}
+--- END BLOG CONTENT ---
 
-Speaking Style Reference Text:
---- START STYLE ---
+**Your Typical Twitter Speaking Style (Tone, Phrasing, Vocabulary):**
+--- START SPEAKING STYLE ---
 {speaking_style}
---- END STYLE ---
+--- END SPEAKING STYLE ---
 
-Tweet to Reply To:
---- START TWEET ---
+**Task:** Generate a reply to the target tweet.
+*   If an image is provided with the tweet (indicated by a following image part), consider its content along with the text when forming your reply. You can refer to objects, scenes, or the general sentiment of the image.
+*   If the tweet is a "Quote Tweet", the input text will be formatted as:
+    "Commenter's Text: [Text added by the person quoting]
+    Original Quoted Text: [Text of the tweet they are quoting]"
+    Your reply should address the commenter's take while being aware of the original quoted content.
+*   If the tweet is a "Native Retweet", the input text will be the content of the original tweet.
+
+**Guidelines for Replying:**
+# ... (rest of instructions as before) ...
+
+4.  **Constraints:**
+    *   Maximum reply length (for the final text): {max_chars} characters.
+    *   **CRITICAL: Output *ONLY* the raw tweet reply text.** No introductions ("Here's a reply:"), explanations, salutations, or any extra formatting. Just the reply itself.
+
+**Tweet to Reply To (Text part):**
+--- START TWEET TEXT ---
 {tweet_text}
---- END TWEET ---
-
-Generated Reply:"""
+--- END TWEET TEXT ---
+"""
 
 
 class GeminiClient:
-    """Interacts with the Google Gemini API asynchronously."""
-
-    def __init__(self, api_key: str, speaking_style_path: Path):
+    # ... (__init__, load_speaking_style, load_blog_content, _fetch_image_data as before) ...
+    def __init__(self, api_key: str, speaking_style_path: Path, blog_content_path: Path):
         if not api_key:
             raise ValueError("Gemini API key is required.")
         if not speaking_style_path or not isinstance(speaking_style_path, Path):
             raise ValueError("Speaking style file path (as a Path object) is required.")
+        if not blog_content_path or not isinstance(blog_content_path, Path):
+            raise ValueError("Blog content file path (as a Path object) is required.")
 
         self.api_key = api_key
         self.speaking_style_path = speaking_style_path
+        self.blog_content_path = blog_content_path
         self.speaking_style = ""
+        self.blog_content = ""
         self.model = None
         self.model_name = GEMINI_MODEL_NAME
 
@@ -5596,17 +5540,14 @@ class GeminiClient:
             raise ConnectionError(f"Failed to configure Gemini client: {e}") from e
 
     async def load_speaking_style(self) -> bool:
-        """Loads the speaking style from the file."""
-        # ... (keep existing load_speaking_style method) ...
         if not self.speaking_style_path.is_file():
             logger.error(f"Speaking style file not found: {self.speaking_style_path}")
             raise FileNotFoundError(f"Speaking style file not found: {self.speaking_style_path}")
         try:
-            with open(self.speaking_style_path, 'r', encoding='utf-8') as f:
-                self.speaking_style = f.read()
+            async with aiofiles.open(self.speaking_style_path, 'r', encoding='utf-8') as f:
+                self.speaking_style = await f.read()
             if not self.speaking_style.strip():
-                logger.error(f"Speaking style file '{self.speaking_style_path}' is empty.")
-                raise ValueError(f"Speaking style file '{self.speaking_style_path}' is empty.")
+                logger.warning(f"Speaking style file '{self.speaking_style_path}' is empty. Replies may lack specific style.")
             logger.info(f"Successfully loaded speaking style from {self.speaking_style_path} ({len(self.speaking_style)} bytes)")
             return True
         except Exception as e:
@@ -5614,128 +5555,228 @@ class GeminiClient:
             self.speaking_style = ""
             raise
 
+    async def load_blog_content(self) -> bool:
+        if not self.blog_content_path.is_file():
+            logger.error(f"Blog content file not found: {self.blog_content_path}")
+            raise FileNotFoundError(f"Blog content file not found: {self.blog_content_path}")
+        try:
+            async with aiofiles.open(self.blog_content_path, 'r', encoding='utf-8') as f:
+                self.blog_content = await f.read()
+            if not self.blog_content.strip():
+                logger.error(f"Blog content file '{self.blog_content_path}' is empty. This is critical for knowledgeable replies.")
+                raise ValueError(f"Blog content file '{self.blog_content_path}' is empty.")
+            logger.info(f"Successfully loaded blog content from {self.blog_content_path} ({len(self.blog_content)} bytes)")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load blog content from '{self.blog_content_path}': {e}", exc_info=True)
+            self.blog_content = ""
+            raise
 
-    async def generate_reply(self, tweet_text: str) -> str | None:
-        """Generates a reply using Gemini based on the tweet and speaking style."""
+    async def _fetch_image_data(self, image_url: str) -> tuple[bytes | None, str | None]:
+        """Fetches image data and determines MIME type."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_url) as resp:
+                    if resp.status == 200:
+                        image_bytes = await resp.read()
+                        try:
+                            img = Image.open(io.BytesIO(image_bytes))
+                            mime_type = Image.MIME.get(img.format.upper()) if img.format else None
+                            if mime_type:
+                                logger.info(f"Fetched image {image_url}, MIME (Pillow): {mime_type}, Size: {len(image_bytes)} bytes")
+                                return image_bytes, mime_type
+                            else:
+                                server_content_type = resp.headers.get('Content-Type')
+                                if server_content_type and server_content_type.startswith('image/'):
+                                     logger.warning(f"Pillow couldn't determine MIME for {image_url} (format: {img.format}), using server's {server_content_type}")
+                                     return image_bytes, server_content_type
+                                else:
+                                     logger.warning(f"Could not determine valid image MIME type for {image_url} from Pillow or server header ({server_content_type}).")
+                                     return None, None
+                        except Exception as e_pil:
+                            logger.warning(f"Pillow error processing image {image_url}: {e_pil}. Falling back to server Content-Type if available.")
+                            server_content_type = resp.headers.get('Content-Type')
+                            if server_content_type and server_content_type.startswith('image/'):
+                                return image_bytes, server_content_type
+                            else:
+                                logger.warning(f"Failed to determine MIME type for {image_url} after Pillow error and invalid server Content-Type ({server_content_type}).")
+                                return None, None
+                    else:
+                        logger.warning(f"Failed to fetch image {image_url}, status: {resp.status}")
+                        return None, None
+        except Exception as e:
+            logger.error(f"Error fetching image {image_url}: {e}", exc_info=True)
+            return None, None
+
+
+    async def generate_reply(self, tweet_text: str, image_urls: list[str] | None = None) -> str | None:
         if not self.model:
-             logger.error("Gemini model not initialized. Cannot generate reply.")
+             logger.error("Gemini model not initialized.")
              return None
-        if not self.speaking_style:
-             logger.error("Speaking style not loaded. Cannot generate reply.")
+        if not self.speaking_style and self.speaking_style_path.exists():
+             logger.error("Speaking style not loaded (file exists but content is empty or load failed).")
              return None
-        if not tweet_text or not tweet_text.strip():
-            logger.warning("Received empty or whitespace-only tweet text. Cannot generate reply.")
-            return None
+        if not self.blog_content:
+             logger.error("Blog content not loaded. This is critical for knowledgeable replies.")
+             return None
 
         try:
-            full_prompt = INSTRUCTION_TEMPLATE.format(
+            prompt_text_part = INSTRUCTION_TEMPLATE_TEXT_PART.format(
                 max_chars=MAX_REPLY_LENGTH,
                 speaking_style=self.speaking_style,
-                tweet_text=tweet_text
+                blog_content=self.blog_content,
+                tweet_text=tweet_text or "[No text content in tweet]"
             )
         except KeyError as e:
             logger.error(f"Error formatting Gemini prompt template (missing key?): {e}")
             return None
+        except Exception as e:
+            logger.error(f"Unexpected error formatting Gemini prompt template: {e}", exc_info=True)
+            return None
 
-        logger.info(f"Sending request to Gemini (model: {self.model_name}) for tweet: \"{tweet_text[:50].strip()}...\"")
-        # logger.debug(f"Full prompt being sent:\n{full_prompt}") # Uncomment for extreme debugging
+        # Construct prompt_parts_for_api as a list of dictionaries or strings
+        prompt_parts_for_api: list[str | dict] = [prompt_text_part]
 
-        response = None # Initialize response variable
+        if image_urls:
+            image_added_context = False
+            for img_url in image_urls[:1]: # Process only the first image
+                image_bytes, mime_type = await self._fetch_image_data(img_url)
+                if image_bytes and mime_type:
+                    try:
+                        # SDK often handles base64 encoding internally if you give it bytes
+                        # For explicit dictionary structure:
+                        import base64
+                        encoded_image_data = base64.b64encode(image_bytes).decode('utf-8')
+                        image_part_dict = {
+                            "inline_data": {
+                                "mime_type": mime_type,
+                                "data": encoded_image_data
+                            }
+                        }
+                        prompt_parts_for_api.append(image_part_dict)
+                        prompt_parts_for_api.append({"text": "[The above image was included with the tweet. Consider it in your reply.]"})
+                        image_added_context = True
+                        logger.info(f"Added image {img_url} to Gemini prompt parts.")
+                        break 
+                    except Exception as e:
+                        logger.error(f"Error preparing image data for {img_url}: {e}")
+            if not image_added_context and image_urls:
+                 prompt_parts_for_api.append({"text": "[An image was linked in the tweet but could not be processed for context.]"})
+
+        logger.info(f"Sending request to Gemini (model: {self.model_name}) for text: \"{(tweet_text or '')[:50].strip()}...\" (Images: {len(image_urls or [])})")
+        # logger.debug(f"Total prompt parts for API: {len(prompt_parts_for_api)}")
+        # for i, part_item in enumerate(prompt_parts_for_api):
+        #     if isinstance(part_item, str):
+        #         logger.debug(f"  Part {i} (str): {part_item[:100]}...")
+        #     elif isinstance(part_item, dict) and "inline_data" in part_item:
+        #         logger.debug(f"  Part {i} (image dict): MIME={part_item['inline_data']['mime_type']}")
+        #     elif isinstance(part_item, dict) and "text" in part_item:
+        #         logger.debug(f"  Part {i} (text dict): {part_item['text'][:100]}...")
+
+
+        response = None
         try:
-            # --- Generate content using the async method ---
-            # Simplified call: Removed generation_config for now, using SAFETY_SETTINGS defined above (currently None/default)
+            use_max_output_tokens_none = "preview" in self.model_name.lower()
+            
+            gen_config_args = {"temperature": 0.65}
+            if use_max_output_tokens_none:
+                gen_config_args["max_output_tokens"] = None
+                logger.info(f"Using max_output_tokens=None for preview model {self.model_name}")
+            else:
+                gen_config_args["max_output_tokens"] = 150
+
+            current_generation_config = generation_types.GenerationConfig(**gen_config_args)
+
             response = await self.model.generate_content_async(
-                contents=full_prompt,
-                safety_settings=SAFETY_SETTINGS
-                # generation_config=genai.types.GenerationConfig(
-                #     # candidate_count=1, # Default is usually 1
-                #     # stop_sequences=['\n'],
-                #     max_output_tokens=150, # Keep a reasonable token limit
-                #     temperature=0.7,
-                # ),
+                contents=prompt_parts_for_api, # This list can contain strings and dicts
+                safety_settings=SAFETY_SETTINGS,
+                generation_config=current_generation_config
             )
-
-            # --- More Robust Response Handling ---
+            # ... (rest of the response handling as before) ...
             generated_text = None
-
-            # Check if candidates exist *before* trying .text
             if not response.candidates:
                 logger.warning("Gemini response has NO candidates.")
-                # Log detailed feedback if available
-                try:
-                    feedback = response.prompt_feedback
-                    logger.warning(f"Prompt Feedback: Block Reason: {feedback.block_reason}, Safety Ratings: {feedback.safety_ratings}")
-                except (AttributeError, ValueError) as feedback_err:
-                    logger.warning(f"Could not retrieve detailed prompt feedback: {feedback_err}")
-                return None # Definitely no text if no candidates
-
-            # If candidates exist, *then* try accessing text
-            try:
-                 # This still might raise ValueError if the *single* candidate is blocked/invalid,
-                 # but we know the list wasn't empty.
-                 generated_text = response.text
-            except ValueError as ve:
-                 # This indicates blocking/issues even with candidates present
-                 logger.warning(f"Accessing response.text failed. Error: {ve}")
-                 # Log candidate details if possible
-                 try:
-                     for candidate in response.candidates:
-                          logger.warning(f"Candidate details: Finish Reason: {candidate.finish_reason}, Safety Ratings: {candidate.safety_ratings}")
-                 except Exception as cand_exc:
-                     logger.warning(f"Could not log candidate details: {cand_exc}")
-                 return None # Blocked or invalid content
-            except Exception as text_exc:
-                 logger.warning(f"Unexpected error accessing response.text: {text_exc}", exc_info=True)
-                 return None # Other unexpected error
-
-
-            # --- Process Valid Text ---
-            if generated_text:
-                trimmed_text = generated_text.strip()
-                if trimmed_text:
-                    # Truncate if needed
-                    if len(trimmed_text) > MAX_REPLY_LENGTH:
-                        logger.warning(f"Gemini response exceeded {MAX_REPLY_LENGTH} chars ({len(trimmed_text)}). Truncating.")
-                        trimmed_text = trimmed_text[:MAX_REPLY_LENGTH]
-
-                    # Minimal check for unwanted boilerplate (adapt if needed)
-                    if trimmed_text.lower().startswith(("generated reply:", "reply:")):
-                        logger.warning("Removing potential boilerplate prefix from reply.")
-                        trimmed_text = trimmed_text.split(":", 1)[-1].strip()
-
-                    if trimmed_text:
-                       logger.info(f"Successfully generated reply: \"{trimmed_text}\"")
-                       return trimmed_text
-                    else:
-                       logger.warning("Gemini response became empty after cleaning/truncating.")
-                       return None
-                else:
-                    logger.warning("Gemini response via .text was empty or whitespace.")
-                    return None
-            else:
-                # This case should be less likely now with the candidate check above
-                logger.warning("Response.text was unexpectedly empty/None despite having candidates.")
+                if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                     logger.warning(f"Prompt Feedback: Block Reason: {response.prompt_feedback.block_reason}, Ratings: {response.prompt_feedback.safety_ratings}")
                 return None
 
+            try:
+                 generated_text = response.text
+            except ValueError as ve:
+                 logger.warning(f"Accessing response.text failed. ValueError: {ve}")
+                 if response.candidates:
+                     for i, candidate in enumerate(response.candidates):
+                          finish_reason_name = candidate.finish_reason.name if candidate.finish_reason else 'N/A'
+                          logger.warning(f"  Candidate {i}: Finish Reason: {finish_reason_name}, Safety Ratings: {candidate.safety_ratings}")
+                 return None
+            except Exception as text_exc:
+                 logger.warning(f"Unexpected error accessing response.text: {text_exc}", exc_info=True)
+                 return None
 
-        # --- Handle API Call Exceptions ---
+            if generated_text:
+                trimmed_text = generated_text.strip().replace('"', '')
+                prefixes_to_remove = [
+                    "Generated Reply (as Ayush Goyal):", "Generated Reply:",
+                    "Reply (as Ayush Goyal):", "Reply:", "Ayush Goyal:",
+                    "Okay, here's a reply:", "Here's a reply:",
+                    "Okay, as Ayush Goyal, my reply would be:"
+                ]
+                for prefix in prefixes_to_remove:
+                    if trimmed_text.lower().startswith(prefix.lower()):
+                        trimmed_text = trimmed_text[len(prefix):].strip()
+                        break
+                
+                if trimmed_text:
+                    if len(trimmed_text) > MAX_REPLY_LENGTH:
+                        logger.warning(f"Gemini response was long ({len(trimmed_text)} chars). Truncating to {MAX_REPLY_LENGTH}.")
+                        last_space_index = trimmed_text[:MAX_REPLY_LENGTH].rfind(' ')
+                        if last_space_index != -1 and last_space_index > MAX_REPLY_LENGTH - 30: # Avoid too short a truncation
+                            trimmed_text = trimmed_text[:last_space_index]
+                        else: 
+                            trimmed_text = trimmed_text[:MAX_REPLY_LENGTH]
+                    
+                    if trimmed_text:
+                       logger.info(f"Successfully generated reply (Ayush Goyal): \"{trimmed_text}\"")
+                       return trimmed_text
+                    else:
+                       logger.warning("Gemini response (Ayush Goyal) became empty after truncation.")
+                       return None
+                else:
+                    logger.warning("Gemini response (Ayush Goyal) via .text was empty or whitespace after prefix removal.")
+                    return None
+            else:
+                logger.warning("Response.text (Ayush Goyal) was unexpectedly empty/None despite having candidates (or after .text access issues).")
+                return None
+        # ... (rest of the error handling for the API call itself as before) ...
         except generation_types.StopCandidateException as sce:
-             # Specific exception if candidate stopped early (e.g., safety)
-             logger.warning(f"Gemini generation stopped unexpectedly (likely safety/policy). StopCandidateException: {sce}")
-             if response: # Log feedback if response object exists
+             logger.warning(f"Gemini generation stopped (likely safety/policy). StopCandidateException: {sce}")
+             if response and hasattr(response, 'prompt_feedback'):
                  try: logger.warning(f"Prompt Feedback: {response.prompt_feedback}")
-                 except Exception: pass
-                 try: logger.warning(f"Candidates: {response.candidates}")
-                 except Exception: pass
+                 except: pass
              return None
+        except aiohttp.ClientError as http_err:
+            logger.error(f"HTTP error fetching image for multimodal prompt: {http_err}", exc_info=True)
+            return None
+        except api_core_exceptions.InvalidArgument as iae:
+            logger.error(f"Gemini API InvalidArgument: {iae}. Prompt (text + image) might be too large or malformed.", exc_info=True)
+            return None
+        except api_core_exceptions.DeadlineExceeded as dee:
+            logger.error(f"Gemini API DeadlineExceeded: {dee}. Request took too long.", exc_info=True)
+            return None
+        except generation_types.BlockedPromptException as bpe:
+            logger.error(f"Gemini prompt was explicitly blocked by API. BlockedPromptException: {bpe}")
+            if response and hasattr(response, 'prompt_feedback'):
+                 logger.warning(f"Prompt Feedback: {response.prompt_feedback}")
+            return None
+        except generation_types.UnsupportedUserLocation as uul:
+            logger.error(f"Gemini API: User location not supported. UnsupportedUserLocation: {uul}")
+            return None
         except api_core_exceptions.GoogleAPIError as api_err:
-            # Catch potential errors from the API call itself (network, auth, quota, etc.)
             logger.error(f"Gemini API call failed: {type(api_err).__name__} - {api_err}", exc_info=True)
             return None
         except Exception as e:
-            # Catch any other unexpected errors during generation/processing
             logger.error(f"Unexpected error during Gemini generation or response processing: {e}", exc_info=True)
-            if response: # Log response details if available
+            if response:
                  logger.error(f"Response object at time of error: {response!r}")
             return None
 
@@ -5956,177 +5997,187 @@ import os
 import sys
 from pathlib import Path
 from twikit import Client as TwikitClient
-from twikit.errors import TwitterException # Generic twikit exception
+from twikit.errors import TwitterException
 
 import config
 import state_manager
 import gemini_client
 import bot
 
-# --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
 )
-# Silence noisy libraries if needed
 logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('httpcore').setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
-logger = logging.getLogger(__name__) # Get logger for this module
-
-# --- Global Flag for Graceful Shutdown ---
 shutdown_requested = False
-main_task = None # To store the main loop task for cancellation
+main_task = None
 
-async def main():
+async def main_loop():
     global shutdown_requested, main_task
     logger.info("=======================================")
     logger.info(" Starting Twitter Gemini Bot Service   ")
     logger.info("=======================================")
 
-    # --- 1. Load Configuration ---
+    cfg = None
     try:
         cfg = config.load_config()
-        cfg_state_file_str = str(cfg['state_file_path'])
+        # Use Path object directly for file paths
+        cfg_state_file_path = cfg['state_file_path']
         cfg_style_file_path = cfg['speaking_style_file_path']
-        cfg_cookie_file_str = str(cfg['twitter_cookie_file_path']) if cfg.get('twitter_cookie_file_path') else None
-        # Store username without the '@' if it exists, as screen_name usually doesn't have it
-        cfg_twitter_username = cfg['twitter_username'].lstrip('@')
+        cfg_blog_content_file_path = cfg['blog_content_file_path']
+        cfg_cookie_file_path_obj = cfg['twitter_cookie_file_path'] # This is already a Path obj from config
+        cfg_twitter_username_raw = cfg['twitter_username'] # Keep original for login
+        cfg_twitter_username_cleaned = cfg_twitter_username_raw.lstrip('@') # For screen name lookups
 
     except (ValueError, FileNotFoundError) as e:
         logger.critical(f"Configuration error: {e}", exc_info=True)
         sys.exit(1)
 
-    # --- 2. Initialize State Manager ---
+    state_mgr = None
     try:
-        state_mgr = state_manager.StateManager(cfg_state_file_str)
+        state_mgr = state_manager.StateManager(cfg_state_file_path)
         await state_mgr.load()
         logger.info("State manager initialized.")
     except Exception as e:
         logger.critical(f"FATAL: Failed to initialize State Manager: {e}", exc_info=True)
         sys.exit(1)
 
-    # --- 3. Initialize Gemini Client ---
     gemini_cli = None
     try:
-        gemini_cli = gemini_client.GeminiClient(cfg['gemini_api_key'], cfg_style_file_path)
+        gemini_cli = gemini_client.GeminiClient(
+            cfg['gemini_api_key'],
+            cfg_style_file_path,
+            cfg_blog_content_file_path
+        )
         await gemini_cli.load_speaking_style()
-        logger.info("Gemini client initialized and speaking style loaded successfully.")
+        await gemini_cli.load_blog_content()
+        logger.info("Gemini client initialized, speaking style and blog content loaded.")
     except (ValueError, ConnectionError, FileNotFoundError) as e:
-         logger.critical(f"FATAL: Failed to initialize Gemini client or load speaking style: {e}", exc_info=True)
+         logger.critical(f"FATAL: Failed to initialize Gemini client or load content: {e}", exc_info=True)
          sys.exit(1)
-    except Exception as e:
+    except Exception as e: # Catch any other unexpected error from Gemini init
          logger.critical(f"FATAL: Unexpected error initializing Gemini client: {e}", exc_info=True)
          sys.exit(1)
 
-
-    # --- 4. Initialize Twitter Client (Twikit) ---
     twikit_cli = None
     try:
-        twikit_cli = TwikitClient('en-US')
+        twikit_cli = TwikitClient('en-US') # Default language
+        
+        login_args = {
+            'auth_info_1': cfg_twitter_username_raw, # Use raw username for login
+            'password': cfg['twitter_password']
+        }
+        login_method_info = [f"user='{cfg_twitter_username_raw}'", "password=***"]
 
-        login_args = {}
-        login_method_info = []
-
-        # Pass username *with* '@' if needed by login, or without if not. Let's assume login needs the raw input.
-        login_args['auth_info_1'] = cfg['twitter_username'] # Use original config value for login
-        login_args['password'] = cfg['twitter_password']
-        login_method_info.append(f"user='{cfg['twitter_username']}'") # Log original form
-        login_method_info.append("password=***")
-
-        if cfg.get('twitter_email'):
+        if cfg.get('twitter_email'): # Check if email is in config
             login_args['auth_info_2'] = cfg['twitter_email']
-            login_method_info.append("email=provided")
+            login_method_info.append(f"email='{cfg['twitter_email']}'")
         else:
-             login_method_info.append("email=not_provided")
+            login_method_info.append("email=not_provided")
 
-        if cfg_cookie_file_str:
-            login_args['cookies_file'] = cfg_cookie_file_str
-            login_method_info.append(f"cookies_file='{cfg_cookie_file_str}'")
-        else:
-            login_method_info.append("cookies_file=not_provided")
-
+        # Use the Path object from config for cookies_file
+        login_args['cookies_file'] = str(cfg_cookie_file_path_obj) # twikit expects string path
+        login_method_info.append(f"cookies_file='{cfg_cookie_file_path_obj.name}'")
+        
         logger.info(f"Attempting Twitter login using: {', '.join(login_method_info)}...")
         await twikit_cli.login(**login_args)
         logger.info("Twikit login method called successfully.")
 
-        # Verify login by fetching self info using get_user_by_screen_name
-        # Use the username *without* the '@' symbol, as expected by screen_name lookups.
-        logger.info(f"Verifying login by fetching user @{cfg_twitter_username}...")
-        # *** FIX APPLIED HERE ***
-        authenticated_user = await twikit_cli.get_user_by_screen_name(cfg_twitter_username)
-        # Check if user object was returned
+        logger.info(f"Verifying login by fetching user @{cfg_twitter_username_cleaned}...")
+        authenticated_user = await twikit_cli.get_user_by_screen_name(cfg_twitter_username_cleaned)
+        
         if not authenticated_user or not authenticated_user.id:
              logger.critical("FATAL: Login seemed successful, but could not fetch own user details afterwards.")
+             # Try to save cookies even on verification failure, as login might have partially worked
+             if hasattr(twikit_cli, 'save_cookies'):
+                try: await twikit_cli.save_cookies(str(cfg_cookie_file_path_obj))
+                except Exception as esc: logger.warning(f"Failed to save cookies after login verification issue: {esc}")
              sys.exit(1)
 
         logger.info(f"Twitter login successful for user: @{authenticated_user.screen_name} (ID: {authenticated_user.id})")
+        cfg['twitter_actual_user_id'] = str(authenticated_user.id) # Store actual ID for bot
+
+        # Save cookies after successful login and verification
+        if hasattr(twikit_cli, 'save_cookies'):
+            try:
+                await twikit_cli.save_cookies(str(cfg_cookie_file_path_obj)) # Ensure it's awaited
+                logger.info(f"Cookies saved to {cfg_cookie_file_path_obj}")
+            except Exception as e_cookie_save:
+                logger.warning(f"Failed to save cookies to {cfg_cookie_file_path_obj}: {e_cookie_save}")
+        else:
+            logger.warning("Twikit client does not have 'save_cookies' method. Cookies might not be saved explicitly by bot.")
+
 
     except AttributeError as e:
-        # Catch if get_user_by_screen_name doesn't exist either
-        logger.critical(f"FATAL: Twitter client attribute error during login/verification: {e}", exc_info=True)
+        logger.critical(f"FATAL: Twitter client attribute error (e.g. method not found): {e}", exc_info=True)
         sys.exit(1)
-    except FileNotFoundError as e:
-        logger.critical(f"FATAL: Twitter login failed - Cookie file issue?: {e}", exc_info=True)
+    except FileNotFoundError as e: # Should be caught by config load if path is invalid before use
+        logger.critical(f"FATAL: Twitter login - Cookie file issue from config: {e}", exc_info=True)
         sys.exit(1)
-    except TwitterException as e:
+    except TwitterException as e: # More specific Twikit errors
         logger.critical(f"FATAL: Failed to login to Twitter or verify user ({type(e).__name__}): {e}", exc_info=True)
         sys.exit(1)
-    except TypeError as e:
-        logger.critical(f"FATAL: TypeError during Twitter login (likely incorrect arguments passed to twikit.login): {e}", exc_info=True)
+    except TypeError as e: # If login arguments are incorrect for Twikit
+        logger.critical(f"FATAL: TypeError during Twitter login (check twikit.login arguments): {e}", exc_info=True)
         sys.exit(1)
-    except Exception as e:
+    except Exception as e: # General catch-all for unforeseen issues during Twitter setup
         logger.critical(f"FATAL: An unexpected error occurred during Twitter client initialization or login: {e}", exc_info=True)
         sys.exit(1)
 
-
-    # --- 5. Initialize Bot ---
+    app_bot = None
     try:
-        # Pass the authenticated user ID to the Bot if needed for self-checks
-        # Or let the bot fetch it itself using the config username
+        # Pass the modified cfg to the bot
         app_bot = bot.Bot(cfg, twikit_cli, gemini_cli, state_mgr)
         logger.info("Application Bot initialized.")
     except Exception as e:
         logger.critical(f"FATAL: Failed to initialize Application Bot: {e}", exc_info=True)
         sys.exit(1)
 
-    # --- 6. Setup Signal Handling for Graceful Shutdown ---
     loop = asyncio.get_running_loop()
-    stop_event = asyncio.Event()
+    stop_event = asyncio.Event() # Used to signal completion for tests, not strictly needed for main run
 
-    def signal_handler(sig):
-        global shutdown_requested, main_task
-        if shutdown_requested:
-            logger.warning(f"Signal {sig} received again, shutdown already in progress.")
-            return
-        logger.info(f"Received signal: {sig}. Initiating graceful shutdown...")
-        shutdown_requested = True
-        if main_task and not main_task.done():
-            logger.info("Cancelling main loop task...")
-            main_task.cancel()
+    def signal_handler_wrapper(sig): # Wrapper to call the main signal_handler
+        nonlocal loop # Ensure loop is the one from main_loop
+        signal_handler(sig, loop, main_task)
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    for sig_name in ('SIGINT', 'SIGTERM'):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            logger.warning(f"Signal {sig_name} not available on this platform. Skipping handler.")
+            continue
         try:
-             loop.add_signal_handler(sig, signal_handler, sig)
-             logger.debug(f"Registered signal handler for {sig} using loop.add_signal_handler")
-        except NotImplementedError:
-             logger.warning(f"asyncio.loop.add_signal_handler not fully supported on this platform for {sig}. Using standard signal.signal.")
-             signal.signal(sig, lambda s, f: signal_handler(s))
+             loop.add_signal_handler(sig, signal_handler_wrapper, sig)
+             logger.debug(f"Registered signal handler for {sig_name} using loop.add_signal_handler")
+        except (NotImplementedError, AttributeError, RuntimeError) :
+             logger.warning(f"asyncio.loop.add_signal_handler not fully supported for {sig_name}. Using standard signal.signal.")
+             # Lambda needs to capture current loop and main_task if signal.signal is used
+             # This part is tricky as signal.signal handlers are not async-aware directly
+             # For simplicity, we'll rely on the loop.add_signal_handler and log if it fails
+             # A more complex setup would be needed for signal.signal to interact with asyncio loop
+             def sync_signal_handler(s, f):
+                 logger.info(f"Sync signal handler caught {s}. Requesting shutdown via global flag.")
+                 global shutdown_requested
+                 shutdown_requested = True
+                 # Attempt to cancel task if loop is running - this is not ideal from sync handler
+                 if main_task and not main_task.done():
+                     loop.call_soon_threadsafe(main_task.cancel)
+
+             signal.signal(sig, sync_signal_handler)
 
 
-    # --- 7. Initial Run ---
     logger.info("Performing initial bot run...")
     try:
-        await app_bot.run_iteration()
+        if app_bot: await app_bot.run_iteration()
         logger.info("Initial bot run completed.")
     except Exception as e:
          logger.error(f"Initial bot run encountered an error: {e}", exc_info=True)
 
-
-    # --- 8. Run Loop ---
     logger.info(f"Entering main run loop. Fetch interval: {cfg['fetch_interval_minutes']} minutes ({cfg['fetch_interval_seconds']} seconds).")
-    main_task = asyncio.current_task()
+    main_task = asyncio.current_task() # Get the current task (which is main_loop)
     try:
         while not shutdown_requested:
             logger.debug(f"Loop running. Shutdown requested: {shutdown_requested}. Sleeping for {cfg['fetch_interval_seconds']}s.")
@@ -6134,33 +6185,31 @@ async def main():
                  await asyncio.sleep(cfg['fetch_interval_seconds'])
             except asyncio.CancelledError:
                  logger.info("Main loop sleep cancelled, likely during shutdown.")
-                 break
+                 break # Exit sleep and then the while loop
 
-            if shutdown_requested:
+            if shutdown_requested: # Check flag again after sleep
                  logger.info("Shutdown requested during sleep interval check, breaking loop.")
                  break
 
             logger.info("Interval finished. Triggering bot iteration...")
             try:
-                 await app_bot.run_iteration()
+                 if app_bot: await app_bot.run_iteration()
             except asyncio.CancelledError:
                  logger.info("Bot iteration cancelled during execution.")
-                 break
-            except Exception as e:
+                 break # Exit iteration and then the while loop
+            except Exception as e: # Catch errors within a single iteration
                  logger.error(f"Bot iteration failed: {e}", exc_info=True)
+                 # Continue to next iteration after a delay, or implement more sophisticated error handling
 
     except asyncio.CancelledError:
          logger.info("Main loop task was cancelled.")
     finally:
         logger.info("Exited main loop.")
-        # --- Graceful Shutdown Logic ---
         logger.info("Performing final state save before exiting...")
         try:
-            if state_mgr:
+            if state_mgr: # Check if state_mgr was successfully initialized
                  await state_mgr.save()
                  logger.info("Final state saved successfully.")
-            else:
-                 logger.warning("State manager was not initialized, skipping final save.")
         except Exception as e:
             logger.error(f"ERROR: Failed to save state during shutdown: {e}", exc_info=True)
 
@@ -6171,7 +6220,7 @@ async def main():
                 if asyncio.iscoroutinefunction(close_method):
                     await close_method()
                     logger.info("Asynchronously closed Twitter client session.")
-                else:
+                else: # Should not happen with modern twikit, but good to check
                     close_method()
                     logger.info("Synchronously closed Twitter client session.")
             except Exception as e:
@@ -6179,26 +6228,39 @@ async def main():
         elif twikit_cli:
              logger.info("Twikit client does not appear to have a 'close' method. Skipping.")
 
-
         logger.info("=======================================")
         logger.info(" Twitter Gemini Bot Service stopped.   ")
         logger.info("=======================================")
-        stop_event.set()
+        stop_event.set() # For testing if needed
+
+# Centralized signal handler function
+def signal_handler(sig, loop, task_to_cancel):
+    global shutdown_requested
+    if shutdown_requested:
+        logger.warning(f"Signal {sig} received again, shutdown already in progress.")
+        return
+    logger.info(f"Received signal: {sig}. Initiating graceful shutdown...")
+    shutdown_requested = True
+    if task_to_cancel and not task_to_cancel.done():
+        logger.info("Cancelling main loop task...")
+        # loop.call_soon_threadsafe(task_to_cancel.cancel) # If called from a different thread by signal.signal
+        task_to_cancel.cancel() # Directly cancel if add_signal_handler is used
 
 
 if __name__ == "__main__":
-    from dotenv import load_dotenv
-    load_dotenv()
-
+    # load_dotenv() is called within config.load_config()
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-         logger.info("KeyboardInterrupt received (outside main loop perhaps?), stopping.")
-    except asyncio.CancelledError:
-         logger.info("Main execution task cancelled.")
+        asyncio.run(main_loop())
+    except KeyboardInterrupt: # This will catch Ctrl+C if it happens outside the main_loop's CancelledError handling
+         logger.info("KeyboardInterrupt received by top-level asyncio.run, stopping.")
+    except asyncio.CancelledError: # Should be handled within main_loop, but as a fallback
+         logger.info("Main execution task cancelled at top-level.")
+    except SystemExit as se: # To allow sys.exit(1) to work as intended
+        logger.info(f"SystemExit called with code {se.code}")
+        sys.exit(se.code)
     except Exception as e:
-         logger.critical(f"Unhandled exception during main execution setup: {e}", exc_info=True)
-         sys.exit(1)
+         logger.critical(f"Unhandled exception during script execution: {e}", exc_info=True)
+         sys.exit(1) # Ensure non-zero exit code for critical errors
     finally:
         logger.info("Application process terminating.")
 
@@ -6208,9 +6270,11 @@ if __name__ == "__main__":
 File: requirements.txt
 ================================================
 twikit
-google-generativeai # Or latest stable version
+google-generativeai
 python-dotenv
-aiofiles # For async file operations (optional but good practice)
+aiofiles
+aiohttp
+Pillow
 
 
 
@@ -6839,6 +6903,182 @@ print(response.text)
 
 
 ================================================
+File: test_gemini_large_context.py
+================================================
+import google.generativeai as genai
+import os
+import asyncio
+from pathlib import Path
+from dotenv import load_dotenv
+# We might not need to directly import generation_types.FinishReason if comparing by value or string representation
+from google.generativeai import types as generation_types # Keep for other type hints if needed
+
+# --- Configuration ---
+BLOG_FILE_PATH = Path("blogs.txt")
+MODEL_NAME = 'gemini-2.5-flash-preview-04-17'
+
+# Simplified prompt for testing
+TEST_PROMPT_TEMPLATE = """
+Your knowledge base consists of the following blog posts:
+--- START BLOG CONTENT ---
+{blog_content}
+--- END BLOG CONTENT ---
+
+Based ONLY on the information in the blog content above, what are the main differences discussed between Snabbit and Urban Company?
+If the information is not present, state that.
+Keep your answer concise.
+"""
+
+# Safety settings
+SAFETY_SETTINGS = {
+    generation_types.HarmCategory.HARM_CATEGORY_HARASSMENT: generation_types.HarmBlockThreshold.BLOCK_NONE,
+    generation_types.HarmCategory.HARM_CATEGORY_HATE_SPEECH: generation_types.HarmBlockThreshold.BLOCK_NONE,
+    generation_types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: generation_types.HarmBlockThreshold.BLOCK_NONE,
+    generation_types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: generation_types.HarmBlockThreshold.BLOCK_NONE,
+}
+
+async def load_file_content(file_path: Path) -> str:
+    if not file_path.is_file():
+        print(f"Error: File not found at {file_path}")
+        return ""
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        print(f"Successfully loaded content from {file_path} ({len(content)} bytes)")
+        return content
+    except Exception as e:
+        print(f"Error loading content from {file_path}: {e}")
+        return ""
+
+async def main():
+    load_dotenv()
+    api_key = os.getenv('GEMINI_API_KEY')
+    if not api_key:
+        print("Error: GEMINI_API_KEY not found.")
+        return
+
+    genai.configure(api_key=api_key)
+
+    print(f"\n--- Fetching Model Info for: {MODEL_NAME} ---")
+    model_info_retrieved = None
+    try:
+        model_info_retrieved = genai.get_model(f'models/{MODEL_NAME}')
+        if model_info_retrieved:
+            print(f"Model Display Name: {model_info_retrieved.display_name}")
+            print(f"Input Token Limit: {model_info_retrieved.input_token_limit}")
+            print(f"Output Token Limit: {model_info_retrieved.output_token_limit}")
+        else:
+            print(f"Could not retrieve info for model {MODEL_NAME}")
+            return
+    except Exception as e:
+        print(f"Error getting model information for {MODEL_NAME}: {e}")
+        return
+
+    print(f"\n--- Loading Blog Content from: {BLOG_FILE_PATH} ---")
+    blog_content_text = await load_file_content(BLOG_FILE_PATH)
+    if not blog_content_text:
+        print("Cannot proceed without blog content.")
+        return
+
+    full_test_prompt = TEST_PROMPT_TEMPLATE.format(blog_content=blog_content_text)
+    print(f"\n--- Prompt Constructed (first 200 chars): ---")
+    print(full_test_prompt[:200] + "...")
+    print(f"... (Total prompt length: {len(full_test_prompt)} characters)")
+
+    model = genai.GenerativeModel(MODEL_NAME)
+
+    print(f"\n--- Counting Input Tokens for the Constructed Prompt ---")
+    try:
+        count_tokens_response = model.count_tokens(full_test_prompt)
+        actual_input_tokens = getattr(count_tokens_response, 'total_tokens', 'N/A')
+        print(f"Estimated Input Tokens by count_tokens(): {actual_input_tokens}")
+        if isinstance(actual_input_tokens, int) and model_info_retrieved and \
+           actual_input_tokens > model_info_retrieved.input_token_limit:
+            print(f"WARNING: Estimated input tokens ({actual_input_tokens}) EXCEED model's input token limit ({model_info_retrieved.input_token_limit})!")
+    except Exception as e:
+        print(f"Error counting tokens: {e}")
+
+    print(f"\n--- Attempting to Generate Content with Large Context (Model: {MODEL_NAME}) ---")
+    try:
+        response = await model.generate_content_async(
+            contents=full_test_prompt,
+            safety_settings=SAFETY_SETTINGS,
+            generation_config=generation_types.GenerationConfig(
+                max_output_tokens=250,
+                temperature=0.5
+            )
+        )
+
+        print("\n--- Gemini API Response ---")
+        generated_text = "No text generated or response was blocked."
+        finish_reason_val = "N/A"
+        prompt_feedback_str = "N/A"
+
+        # It's good practice to check if response and response.candidates exist
+        if response and response.candidates:
+            candidate = response.candidates[0]
+            # candidate.finish_reason is an enum, e.g. FinishReason.STOP
+            # We can get its name for a more readable string or its value (integer)
+            finish_reason_name = candidate.finish_reason.name # e.g., "STOP", "MAX_TOKENS"
+            finish_reason_val = candidate.finish_reason.value # e.g., 1, 2
+
+            print(f"Finish Reason Name: {finish_reason_name}") # Log the name
+            print(f"Finish Reason Value: {finish_reason_val}")   # Log the integer value
+
+            if finish_reason_name == "STOP": # Compare with the string name
+                try:
+                    generated_text = response.text
+                except ValueError as ve:
+                    generated_text = f"Error accessing response.text: {ve}. Likely blocked."
+                    if candidate.content and candidate.content.parts:
+                        generated_text += f" Parts: {[part.text for part in candidate.content.parts if hasattr(part, 'text')]}"
+                    else:
+                        generated_text += " No valid parts found in candidate."
+            elif finish_reason_name == "MAX_TOKENS":
+                generated_text = "Generation stopped due to MAX_TOKENS. Output might be incomplete."
+                try: generated_text += f" Partial: {response.text}"
+                except: pass # response.text might error if no valid part due to MAX_TOKENS
+            elif finish_reason_name == "SAFETY":
+                generated_text = f"Generation stopped due to SAFETY. Ratings: {candidate.safety_ratings}"
+            else: # Other reasons like RECITATION, OTHER
+                generated_text = f"Generation stopped. Finish Reason: {finish_reason_name}."
+        else:
+            print("Response did not contain any candidates.")
+
+
+        # This print statement was for the old variable name.
+        # Let's keep it consistent or remove if the new ones above are sufficient.
+        # print(f"Finish Reason: {finish_reason_val}") # This variable `finish_reason_val` now holds the integer value
+                                                   # Or you can print `finish_reason_name`
+
+        if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+            prompt_feedback_str = (
+                f"Block Reason: {response.prompt_feedback.block_reason}, "
+                f"Safety Ratings: {response.prompt_feedback.safety_ratings}"
+            )
+        print(f"Prompt Feedback: {prompt_feedback_str}") # This is fine
+        print("\nGenerated Text:")
+        print("-----------------------------------------")
+        print(generated_text)
+        print("-----------------------------------------")
+
+        if hasattr(response, 'usage_metadata'):
+            print("\nUsage Metadata:")
+            print(f"  Prompt Token Count (from metadata): {response.usage_metadata.prompt_token_count}")
+            print(f"  Candidates Token Count: {response.usage_metadata.candidates_token_count}")
+            print(f"  Total Token Count: {response.usage_metadata.total_token_count}")
+
+    except Exception as e:
+        print(f"An error occurred during content generation: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+
+================================================
 File: data/processed_tweets.json
 ================================================
 [
@@ -6894,6 +7134,25 @@ File: data/processed_tweets.json
   "1907134926266241117",
   "1907136161576812788",
   "1907137098907328902",
-  "1907138190840062289"
+  "1907138190840062289",
+  "1914311306477252973",
+  "1922115721405895129",
+  "1927989509339103630",
+  "1928428222418501835",
+  "1928680347870376311",
+  "1928699798103744704",
+  "1928710221641167046",
+  "1928723109747568663",
+  "1928777968223932439",
+  "1928804566910283798",
+  "1928828112030011630",
+  "1928841040762490882",
+  "1928844652763033738",
+  "1928847135216382109",
+  "1928847284717904329",
+  "1928853222560534892",
+  "1928862906650603654",
+  "1928864894025125918",
+  "1928867021535461695"
 ]
 

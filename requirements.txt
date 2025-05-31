@@ -1,4 +1,6 @@
 twikit
-google-generativeai # Or latest stable version
+google-generativeai
 python-dotenv
-aiofiles # For async file operations (optional but good practice)
+aiofiles
+aiohttp
+Pillow

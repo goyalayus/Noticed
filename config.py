@@ -1,13 +1,13 @@
 import os
 import logging
 from dotenv import load_dotenv
-from pathlib import Path # Use pathlib for better path handling
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 def load_config():
     """Loads configuration from .env file and environment variables."""
-    load_dotenv()  # Load variables from .env file
+    load_dotenv()
 
     config = {}
 
@@ -21,7 +21,7 @@ def load_config():
     config['twitter_username'] = os.getenv('TWITTER_USERNAME')
     config['twitter_email'] = os.getenv('TWITTER_EMAIL')
     config['twitter_password'] = os.getenv('TWITTER_PASSWORD')
-    config['twitter_cookie_file'] = os.getenv('TWITTER_COOKIE_FILE')
+    config['twitter_cookie_file'] = os.getenv('TWITTER_COOKIE_FILE') # Path to cookies.json
 
     if not config['twitter_username']:
          logger.critical("FATAL ERROR: Missing required environment variable: TWITTER_USERNAME")
@@ -30,23 +30,24 @@ def load_config():
          logger.critical("FATAL ERROR: Missing required environment variable: TWITTER_PASSWORD")
          raise ValueError("Missing TWITTER_PASSWORD")
 
-    cookie_path = None
-    if config['twitter_cookie_file']:
-        cookie_path = Path(config['twitter_cookie_file'])
+    cookie_path_str = config['twitter_cookie_file']
+    if cookie_path_str:
+        cookie_path = Path(cookie_path_str)
         if not cookie_path.is_file():
-            logger.warning(f"TWITTER_COOKIE_FILE ('{config['twitter_cookie_file']}') not found. Login will rely on credentials only.")
-            config['twitter_cookie_file_path'] = None # Ensure it's None if not found
+            logger.warning(f"TWITTER_COOKIE_FILE ('{cookie_path_str}') not found or is not a file. Login will rely on credentials only and may attempt to create/update this file.")
+            config['twitter_cookie_file_path'] = cookie_path # Store path even if not existing yet for twikit to use
         else:
             config['twitter_cookie_file_path'] = cookie_path
             logger.info(f"Twitter cookie file found: {cookie_path}")
     else:
-        config['twitter_cookie_file_path'] = None
-        logger.info("TWITTER_COOKIE_FILE not set. Login will rely on credentials and create/update cookies.json if possible.")
+        default_cookie_path = Path('cookies.json')
+        config['twitter_cookie_file_path'] = default_cookie_path
+        logger.info(f"TWITTER_COOKIE_FILE not set in .env. Defaulting to use/create '{default_cookie_path}'.")
 
 
     # --- Bot Settings ---
     config['speaking_style_file_path'] = Path(os.getenv('SPEAKING_STYLE_FILE_PATH', 'speaking_style.txt'))
-    config['blog_content_file_path'] = Path(os.getenv('BLOG_CONTENT_FILE_PATH', 'blogs.txt')) # <<< NEW
+    # Removed: config['blog_content_file_path']
     config['state_file_path'] = Path(os.getenv('STATE_FILE_PATH', 'data/processed_tweets.json'))
 
     try:
@@ -95,30 +96,11 @@ def load_config():
         logger.critical(f"FATAL ERROR: Speaking style file not found at '{config['speaking_style_file_path']}'.")
         raise FileNotFoundError(f"Speaking style file not found: {config['speaking_style_file_path']}")
 
-    # <<< NEW: Ensure blog content file exists >>>
-    if not config['blog_content_file_path'].is_file():
-        logger.critical(f"FATAL ERROR: Blog content file not found at '{config['blog_content_file_path']}'.")
-        raise FileNotFoundError(f"Blog content file not found: {config['blog_content_file_path']}")
+    # Removed check for blog_content_file_path
+    # if not config['blog_content_file_path'].is_file():
+    #     logger.critical(f"FATAL ERROR: Blog content file not found at '{config['blog_content_file_path']}'.")
+    #     raise FileNotFoundError(f"Blog content file not found: {config['blog_content_file_path']}")
 
     logger.info("Configuration loaded successfully.")
     return config
 
-# Example usage (optional, for testing)
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
-    try:
-        cfg = load_config()
-        print("\n--- Loaded Config (Passwords Masked) ---")
-        for key, value in cfg.items():
-            if ('password' in key.lower() or 'api_key' in key.lower()) and value:
-                 print(f"  {key}: ******")
-            elif isinstance(value, Path):
-                 print(f"  {key}: {str(value)}")
-            else:
-                 print(f"  {key}: {value}")
-        print("----------------------------------------")
-
-    except (ValueError, FileNotFoundError) as e:
-        print(f"\nError loading config: {e}")
-    except Exception as e:
-        print(f"\nUnexpected error during config load test: {e}")

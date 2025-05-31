@@ -3,15 +3,8 @@ import time
 import asyncio
 import random
 from twikit import Client as TwikitClient
-from twikit.tweet import Tweet # Import Tweet type hint
-
-# Try importing NotFound, fall back to base exception if needed
-try:
-    from twikit.errors import NotFound, Forbidden, TwitterException
-except ImportError:
-    # If NotFound doesn't exist, just import the others
-    from twikit.errors import Forbidden, TwitterException
-    NotFound = None # Define NotFound as None so the except block can check
+from twikit.tweet import Tweet # Explicitly import Tweet for type hinting
+from twikit.errors import NotFound, Forbidden, TwitterException
 
 from state_manager import StateManager
 from gemini_client import GeminiClient
@@ -19,8 +12,6 @@ from gemini_client import GeminiClient
 logger = logging.getLogger(__name__)
 
 class Bot:
-    """Orchestrates the bot's main logic."""
-
     def __init__(
         self,
         config: dict,
@@ -34,217 +25,195 @@ class Bot:
         self.state_manager = state_manager
         self.min_delay = config['min_reply_delay_seconds']
         self.max_delay = config['max_reply_delay_seconds']
-        self.own_user_id = None # Initialize own user ID
+        self.own_user_id = config.get('twitter_actual_user_id', None) # Get from config if set by main.py
+        self.bot_screen_name = config.get('twitter_username', '').lstrip('@')
 
 
-    async def _ensure_own_user_id(self):
-        """Fetches and caches the bot's own user ID if not already done."""
+    async def _ensure_own_user_id(self): # Keep this for fallback if not set by main.py
         if self.own_user_id is None:
-            bot_username = self.config.get('twitter_username', '').lstrip('@')
-            if not bot_username:
+            bot_username_to_fetch = self.bot_screen_name
+            if not bot_username_to_fetch:
                 logger.error("Twitter username missing in config. Cannot fetch own user ID.")
                 return
-
             try:
-                logger.info(f"Fetching own user details for @{bot_username}...")
-                me_user = await self.twikit_client.get_user_by_screen_name(bot_username)
+                logger.info(f"Fetching own user details for @{bot_username_to_fetch}...")
+                me_user = await self.twikit_client.get_user_by_screen_name(bot_username_to_fetch)
                 if me_user and me_user.id:
-                    self.own_user_id = me_user.id
-                    logger.info(f"Fetched own user ID: {self.own_user_id}")
+                    self.own_user_id = str(me_user.id)
+                    logger.info(f"Fetched own user ID: {self.own_user_id} for @{me_user.screen_name}")
                 else:
-                    logger.error(f"Could not fetch valid user details for @{bot_username}.")
+                    logger.error(f"Could not fetch valid user details for @{bot_username_to_fetch}.")
             except TwitterException as e:
-                logger.error(f"Could not fetch own user details for @{bot_username}: {e}. Self-checks will be skipped.")
-            except AttributeError:
-                logger.error(f"Could not fetch own user details for @{bot_username} due to missing 'get_user_by_screen_name' method or user attributes.")
+                logger.error(f"Could not fetch own user details for @{bot_username_to_fetch} (Twikit Error): {e}.")
             except Exception as e:
-                 logger.error(f"Unexpected error fetching own user details for @{bot_username}: {e}")
+                 logger.error(f"Unexpected error fetching own user details for @{bot_username_to_fetch}: {e}")
 
 
     async def run_iteration(self) -> None:
-        """Performs one cycle of fetching, generating, and replying."""
         logger.info("Starting bot iteration...")
         iteration_start_time = time.monotonic()
-        processed_count = 0
-        reply_count = 0
-        error_count = 0
+        processed_this_iteration = 0 # Renamed for clarity
+        replied_this_iteration = 0   # Renamed for clarity
+        errors_this_iteration = 0    # Renamed for clarity
         state_changed = False
 
-        # --- Uncomment this block if you want to enable self-checks ---
-        # logger.info("Ensuring own user ID is known for self-checks...")
-        # await self._ensure_own_user_id()
-        # if not self.own_user_id:
-        #     logger.warning("Own user ID could not be determined. Self-checks will be disabled.")
-        # -------------------------------------------------------------
+        if not self.own_user_id: # Attempt to fetch if not available from config
+            await self._ensure_own_user_id()
 
-        # 1. Fetch Home Timeline Tweets
-        tweets = []
+        tweets: list[Tweet] = [] # Ensure tweets is typed
         try:
             logger.info(f"Fetching up to {self.config['tweets_to_fetch']} tweets from latest timeline...")
-            # *** FIX APPLIED HERE: Use get_latest_timeline ***
-            # Assuming it takes a 'count' argument similar to the previous attempt.
-            # Further verification might be needed if it uses different parameters.
             timeline_result = await self.twikit_client.get_latest_timeline(count=self.config['tweets_to_fetch'])
 
-            # Process the result - could be list, iterator, or async iterator
             if hasattr(timeline_result, '__aiter__'):
-                 logger.debug("Timeline result is an async iterator.")
                  tweets = [t async for t in timeline_result]
             elif hasattr(timeline_result, '__iter__') and not isinstance(timeline_result, str):
-                 logger.debug("Timeline result is a sync iterator or list.")
                  tweets = list(timeline_result)
-            # No need for explicit list check if list also has __iter__
-            # elif isinstance(timeline_result, list):
-            #      logger.debug("Timeline result is a list.")
-            #      tweets = timeline_result
             else:
-                 logger.warning(f"Unexpected type returned by get_latest_timeline: {type(timeline_result)}. Assuming empty list.")
-                 tweets = []
-
+                 logger.warning(f"Unexpected type from get_latest_timeline: {type(timeline_result)}. Assuming empty.")
+            
             if not tweets:
-                 logger.info("No new tweets found in timeline fetch for this iteration.")
-                 # Optional: Save state even if no tweets found, to record the check time?
-                 # if state_changed: await self.state_manager.save()
-                 return # Successful iteration, nothing new to do
-
-            logger.info(f"Fetched {len(tweets)} tweets. Processing potential replies...")
-
-        except AttributeError:
-             # This might catch if 'get_latest_timeline' also doesn't exist, but unlikely given the previous error msg
-             logger.critical(f"FATAL: The 'get_latest_timeline' method does not seem to exist on the twikit client.", exc_info=True)
-             raise # Re-raise to stop the bot service
-
+                 logger.info("No new tweets found in timeline fetch.")
+                 return
+            logger.info(f"Fetched {len(tweets)} tweets. Processing potential replies (oldest first)...")
+        # ... (rest of the timeline fetching error handling as before) ...
+        except AttributeError as e:
+             logger.critical(f"FATAL: Method missing in twikit client (e.g., 'get_latest_timeline'): {e}", exc_info=True)
+             raise
         except TypeError as e:
-            # Catch if 'count' is not a valid argument for get_latest_timeline
-            logger.critical(f"FATAL: TypeError calling 'get_latest_timeline'. Does it accept a 'count' argument? Error: {e}", exc_info=True)
-            raise # Re-raise to stop the bot service
-
+            logger.critical(f"FATAL: TypeError calling timeline fetch: {e}", exc_info=True)
+            raise
         except TwitterException as e:
-            logger.error(f"Failed to fetch Twitter timeline using get_latest_timeline: {e}", exc_info=True)
-            return # End this iteration
+            logger.error(f"Failed to fetch Twitter timeline: {e}", exc_info=False)
+            return
         except Exception as e:
-            logger.error(f"An unexpected error occurred during timeline fetch: {e}", exc_info=True)
-            return # End this iteration
+            logger.error(f"An unexpected error during timeline fetch: {e}", exc_info=True)
+            return
 
-
-        # Process oldest first in the fetched batch
-        for i, tweet in enumerate(reversed(tweets)):
-            # Check if it's a valid Tweet object from twikit
-            if not isinstance(tweet, Tweet) or not hasattr(tweet, 'id') or not hasattr(tweet, 'text'):
-                 # Log the type if it's unexpected
-                 logger.warning(f"Skipping invalid/unexpected timeline item (type: {type(tweet)}): {tweet!r}")
+        for i, tweet_obj in enumerate(reversed(tweets)): # Use a more descriptive name
+            if not isinstance(tweet_obj, Tweet) or not hasattr(tweet_obj, 'id'):
+                 logger.warning(f"Skipping invalid timeline item (type: {type(tweet_obj)}): {tweet_obj!r}")
                  continue
 
-            tweet_id = str(tweet.id)
-            tweet_text = tweet.text or "" # Ensure text is not None
-            tweet_author_user = getattr(tweet, 'user', None)
-            # Safely access screen_name, provide default
-            tweet_author_handle = getattr(tweet_author_user, 'screen_name', 'unknown_user') if tweet_author_user else 'unknown_user'
-            tweet_url = f"https://x.com/{tweet_author_handle}/status/{tweet_id}"
+            tweet_id_str = str(tweet_obj.id)
+            
+            tweet_author = getattr(tweet_obj, 'user', None)
+            tweet_author_id = str(getattr(tweet_author, 'id', None)) if tweet_author else None
+            tweet_author_handle = getattr(tweet_author, 'screen_name', 'unknown_user') if tweet_author else 'unknown_user'
+            current_tweet_url = f"https://x.com/{tweet_author_handle}/status/{tweet_id_str}"
 
-            logger.info(f"Checking tweet ({i+1}/{len(tweets)}): {tweet_url}")
+            logger.info(f"Checking tweet ({i+1}/{len(tweets)}): {current_tweet_url} by @{tweet_author_handle}")
 
-            # 2. Check if Already Processed
-            if self.state_manager.is_processed(tweet_id):
-                logger.info(f"Skipping already processed tweet ID {tweet_id}")
+            if self.state_manager.is_processed(tweet_id_str):
+                logger.info(f"Skipping already processed tweet ID {tweet_id_str}")
                 continue
 
-            processed_count += 1 # Count tweets we actually attempt to process
+            if self.own_user_id:
+                if tweet_author_id == self.own_user_id:
+                    logger.info(f"Skipping own tweet: {tweet_id_str}")
+                    await self.state_manager.mark_processed(tweet_id_str); state_changed = True
+                    continue
+                
+                reply_to_user_id_val = getattr(tweet_obj, 'in_reply_to_user_id_str', None)
+                if reply_to_user_id_val == self.own_user_id:
+                    logger.info(f"Skipping reply to self: {tweet_id_str}")
+                    await self.state_manager.mark_processed(tweet_id_str); state_changed = True
+                    continue
+            
+            processed_this_iteration += 1
 
-            # --- Optional Self-Checks (Requires _ensure_own_user_id to be called and successful) ---
-            # if self.own_user_id:
-            #     try:
-            #         tweet_author_id = getattr(tweet_author_user, 'id', None)
-            #         if tweet_author_id and str(tweet_author_id) == str(self.own_user_id):
-            #             logger.info(f"Skipping own tweet: {tweet_id}")
-            #             await self.state_manager.mark_processed(tweet_id)
-            #             state_changed = True
-            #             continue
-            #
-            #         reply_to_user_id_str = getattr(tweet, 'in_reply_to_user_id_str', None)
-            #         if reply_to_user_id_str and reply_to_user_id_str == str(self.own_user_id):
-            #             logger.info(f"Skipping reply to self: {tweet_id}")
-            #             await self.state_manager.mark_processed(tweet_id)
-            #             state_changed = True
-            #             continue
-            #     except Exception as e:
-            #          logger.warning(f"Error during self-check for tweet {tweet_id}: {e}", exc_info=False)
-            # ------------------------------------------------------------------------------------
+            # --- Enhanced Context Extraction for Retweets and Quote Tweets ---
+            text_for_gemini = getattr(tweet_obj, 'text', "") or ""
+            image_urls_for_gemini = []
 
-            # 3. Generate Reply using Gemini
-            if not tweet_text.strip():
-                logger.warning(f"Skipping tweet {tweet_id} because its text is empty or whitespace.")
-                await self.state_manager.mark_processed(tweet_id) # Mark as processed to avoid retrying
-                state_changed = True
+            # Helper to extract media URLs
+            def get_media_urls(media_list):
+                urls = []
+                if media_list:
+                    for media_item in media_list:
+                        if getattr(media_item, 'type', None) == 'photo':
+                            url = getattr(media_item, 'media_url_https', None)
+                            if url: urls.append(url)
+                return urls
+
+            # Extract images from the current tweet object first
+            image_urls_for_gemini.extend(get_media_urls(getattr(tweet_obj, 'media', None)))
+
+            is_native_retweet = hasattr(tweet_obj, 'retweeted_status') and tweet_obj.retweeted_status is not None
+            is_quote_tweet = hasattr(tweet_obj, 'quoted_status') and tweet_obj.quoted_status is not None
+
+            if is_native_retweet:
+                original_rt_status = tweet_obj.retweeted_status
+                logger.info(f"Tweet {tweet_id_str} is a native retweet of {getattr(original_rt_status, 'id', 'N/A')}. Using original tweet's content.")
+                text_for_gemini = getattr(original_rt_status, 'text', "") or ""
+                # If the retweet itself had no media, check the original retweeted status for media
+                if not image_urls_for_gemini:
+                    image_urls_for_gemini.extend(get_media_urls(getattr(original_rt_status, 'media', None)))
+            
+            elif is_quote_tweet:
+                quoted_status_obj = tweet_obj.quoted_status
+                commenter_text = getattr(tweet_obj, 'text', "") or "" # Text added by the one quoting
+                original_quoted_text = getattr(quoted_status_obj, 'text', "") or ""
+                
+                logger.info(f"Tweet {tweet_id_str} is a quote tweet. Quoted tweet ID: {getattr(quoted_status_obj, 'id', 'N/A')}. Combining texts.")
+                text_for_gemini = (
+                    f"Commenter's Text: {commenter_text}\n"
+                    f"Original Quoted Text: {original_quoted_text}"
+                )
+                # Prioritize images from the quote tweet's comment if any, then from original quoted
+                if not image_urls_for_gemini: # If tweet_obj.media (commenter's media) was empty
+                    image_urls_for_gemini.extend(get_media_urls(getattr(quoted_status_obj, 'media', None)))
+
+            if not text_for_gemini.strip() and not image_urls_for_gemini:
+                logger.warning(f"Skipping tweet {tweet_id_str}: no effective text and no processable images after context extraction.")
+                await self.state_manager.mark_processed(tweet_id_str); state_changed = True
                 continue
-
-            logger.info(f"Generating reply for tweet ID {tweet_id}...")
-            reply_text = await self.gemini_client.generate_reply(tweet_text)
+            
+            logger.info(f"Generating reply for tweet ID {tweet_id_str} (Text: '{text_for_gemini[:30].strip()}...', Images: {len(image_urls_for_gemini)})")
+            reply_text = await self.gemini_client.generate_reply(text_for_gemini, image_urls_for_gemini)
 
             if not reply_text:
-                logger.warning(f"Gemini did not return a reply for tweet {tweet_id}. Skipping post.")
-                error_count += 1
-                await self.state_manager.mark_processed(tweet_id)
-                state_changed = True
+                logger.warning(f"Gemini did not return a reply for tweet {tweet_id_str}. Skipping post.")
+                errors_this_iteration += 1
+                await self.state_manager.mark_processed(tweet_id_str); state_changed = True
                 continue
 
-            # 4. Post Reply to Twitter
-            logger.info(f"Attempting to post reply to tweet ID {tweet_id}...")
+            logger.info(f"Attempting to post reply to tweet ID {tweet_id_str}...")
             try:
-                # Ensure the tweet object has the 'reply' method
-                if not hasattr(tweet, 'reply') or not callable(tweet.reply):
-                    logger.error(f"Tweet object for ID {tweet_id} does not have a callable 'reply' method. Skipping reply.")
-                    error_count += 1
-                    # Mark as processed? Or leave for potential future fix? Let's mark it.
-                    await self.state_manager.mark_processed(tweet_id)
-                    state_changed = True
+                if not hasattr(tweet_obj, 'reply') or not callable(tweet_obj.reply):
+                    logger.error(f"Tweet object for ID {tweet_id_str} (user @{tweet_author_handle}) does not have a callable 'reply' method.")
+                    errors_this_iteration += 1
+                    await self.state_manager.mark_processed(tweet_id_str); state_changed = True
                     continue
 
-                reply_tweet = await tweet.reply(reply_text)
-                reply_count += 1
+                replied_tweet = await tweet_obj.reply(reply_text)
+                replied_this_iteration += 1
                 state_changed = True
-                reply_tweet_id = getattr(reply_tweet, 'id', 'UNKNOWN_ID')
-                logger.info(f"Successfully posted reply to {tweet_url}. New tweet ID: {reply_tweet_id}")
+                replied_tweet_id = getattr(replied_tweet, 'id', 'UNKNOWN_ID')
+                logger.info(f"Successfully posted reply to {current_tweet_url}. New tweet ID: {replied_tweet_id}")
+                await self.state_manager.mark_processed(tweet_id_str)
 
-                # 5. Mark as Processed (only after successful post)
-                await self.state_manager.mark_processed(tweet_id)
-
-                # 6. Randomized Delay
                 is_last_tweet_in_batch = (i == len(tweets) - 1)
-                if not is_last_tweet_in_batch:
+                if not is_last_tweet_in_batch and replied_this_iteration > 0:
                     delay = random.uniform(self.min_delay, self.max_delay)
-                    logger.info(f"Waiting for {delay:.2f}s (randomized {self.min_delay}-{self.max_delay}s) before processing next tweet...")
+                    logger.info(f"Waiting for {delay:.2f}s before next tweet...")
                     await asyncio.sleep(delay)
-                else:
-                    logger.info("Successfully replied to the last tweet in this batch. No intra-batch delay needed.")
 
-            # Specific exception handling for replies
-            except NotFound if NotFound else Exception as e:
-                 if NotFound and isinstance(e, NotFound):
-                     logger.warning(f"Original tweet {tweet_id} not found when trying to reply (NotFound error). Maybe deleted? Skipping.")
-                     error_count += 1
-                     await self.state_manager.mark_processed(tweet_id) # Mark as processed
-                     state_changed = True
-                 else:
-                     # Reraise if NotFound not defined or error is different, to be caught below
-                     raise e
-
+            except NotFound:
+                 logger.warning(f"Original tweet {tweet_id_str} not found (NotFound error). Maybe deleted? Skipping.")
+                 errors_this_iteration += 1
+                 await self.state_manager.mark_processed(tweet_id_str); state_changed = True
             except Forbidden as e:
-                 logger.error(f"Forbidden to reply to tweet {tweet_id}: {e}. Skipping.", exc_info=False) # Less verbose log
-                 error_count += 1
-                 await self.state_manager.mark_processed(tweet_id) # Mark as processed
-                 state_changed = True
+                 logger.error(f"Forbidden to reply to tweet {tweet_id_str}: {e}. Skipping.", exc_info=False)
+                 errors_this_iteration += 1
+                 await self.state_manager.mark_processed(tweet_id_str); state_changed = True
             except TwitterException as e:
-                # More specific error logging could go here based on e.response or e.api_codes if available
-                logger.error(f"Twitter API error posting reply for tweet {tweet_id}: {e}", exc_info=True)
-                error_count += 1
-                # Don't mark as processed, could be temporary (rate limit, etc.)
+                logger.error(f"Twitter API error posting reply for tweet {tweet_id_str}: {e}", exc_info=False)
+                errors_this_iteration += 1
             except Exception as e:
-                 logger.error(f"An unexpected error occurred while replying to {tweet_id}: {e}", exc_info=True)
-                 error_count += 1
-                 # Consider marking processed only for certain unexpected errors, otherwise retry might be ok
+                 logger.error(f"An unexpected error replying to {tweet_id_str}: {e}", exc_info=True)
+                 errors_this_iteration += 1
 
-        # 7. Save State if Changed
         if state_changed:
             logger.info("Saving updated state...")
             await self.state_manager.save()
@@ -252,5 +221,5 @@ class Bot:
         iteration_duration = time.monotonic() - iteration_start_time
         logger.info(
             f"Iteration completed in {iteration_duration:.2f}s. "
-            f"Checked: {processed_count}, Replied: {reply_count}, Errors: {error_count}."
+            f"Tweets processed: {processed_this_iteration}, Replied: {replied_this_iteration}, Errors: {errors_this_iteration}."
         )
